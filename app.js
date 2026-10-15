@@ -17,11 +17,39 @@ const grab = document.createElement('canvas');
 const grabCtx = grab.getContext('2d', { willReadFrequently: true });
 let frameReady = false; // `frame` holds a captured picture (reset when the camera starts)
 
+// Heatmap from the detector (a quarter of the analysed frame size), coloured through a lookup table:
+// transparent for no heat, then red, orange and yellow as it gets hotter.
+const heatCanvas = document.createElement('canvas');
+const heatCtx = heatCanvas.getContext('2d');
+let heatImage = null;
+let heat = null;
+const HEAT_COLORS = (() => {
+  const lut = new Uint8ClampedArray(256 * 4);
+  for (let v = 0; v < 256; v++) {
+    const t = v / 255;
+    lut[4 * v] = 255;
+    lut[4 * v + 1] = 255 * Math.min(1, Math.max(0, (t - 0.3) / 0.7));
+    lut[4 * v + 2] = 255 * Math.min(1, Math.max(0, (t - 0.85) / 0.15)) * 0.5;
+    lut[4 * v + 3] = t < 0.05 ? 0 : 255 * Math.min(0.75, 0.15 + 0.8 * t);
+  }
+  return lut;
+})();
+
 const SETTINGS_KEY = 'motiondetect.settings';
 // Bump when a default changes in a way that should override what's saved on the phone.
 const SETTINGS_VERSION = 2;
 const settings = Object.assign(
-  { sensitivity: 6, minSize: 3, holdSeconds: 3, detail: 800, syncVideo: true, showStats: false, facing: 'environment' },
+  {
+    sensitivity: 6,
+    minSize: 3,
+    display: 'heatmap', // 'heatmap', 'boxes' or 'both'
+    heatFade: 1, // seconds
+    holdSeconds: 3,
+    detail: 800,
+    syncVideo: true,
+    showStats: false,
+    facing: 'environment',
+  },
   loadSettings(),
   { version: SETTINGS_VERSION }
 );
@@ -66,6 +94,8 @@ function detectorOptions() {
     // through specks of a couple of pixels, 10 only things covering several percent of the view.
     minArea: 0.0001 * Math.pow(2.4, settings.minSize - 3),
     holdMs: settings.holdSeconds * 1000,
+    heatmap: settings.display !== 'boxes',
+    heatFadeMs: settings.heatFade * 1000,
   };
 }
 
@@ -76,6 +106,12 @@ function applySettings() {
   $('min-size-out').textContent = settings.minSize;
   $('hold').value = settings.holdSeconds;
   $('hold-out').textContent = settings.holdSeconds ? settings.holdSeconds + ' s' : 'off';
+  $('display').value = settings.display;
+  $('heat-fade').value = settings.heatFade;
+  $('heat-fade-out').textContent = settings.heatFade + ' s';
+  // Only show the settings that apply to the chosen display.
+  $('heat-fade-row').hidden = settings.display === 'boxes';
+  $('hold-row').hidden = settings.display === 'heatmap';
   $('detail').value = String(settings.detail);
   $('sync-video').checked = settings.syncVideo;
   $('show-stats').checked = settings.showStats;
@@ -89,6 +125,8 @@ $('settings').addEventListener('input', () => {
   settings.sensitivity = Number($('sensitivity').value);
   settings.minSize = Number($('min-size').value);
   settings.holdSeconds = Number($('hold').value);
+  settings.display = $('display').value;
+  settings.heatFade = Number($('heat-fade').value);
   settings.detail = Number($('detail').value);
   settings.showStats = $('show-stats').checked;
   settings.syncVideo = $('sync-video').checked;
@@ -116,6 +154,7 @@ function startWorker() {
     } else if (msg.type === 'result') {
       inFlight = false;
       boxes = msg.boxes;
+      heat = msg.heat;
       lastMode = msg.mode;
       stats.ms = msg.ms;
       stats.inliers = msg.inliers;
@@ -166,6 +205,7 @@ async function startCamera() {
   stage.classList.toggle('mirrored', settings.facing === 'user');
   running = true;
   boxes = [];
+  heat = null;
   frameReady = false;
   worker.postMessage({ type: 'reset' });
   $('start-screen').hidden = true;
@@ -293,15 +333,20 @@ function draw() {
     const note = lastMode === 'lost' ? ' · moving too fast' : lastMode === 'noisy' ? ' · unstable' : '';
     hud.textContent =
       `${stats.fps.toFixed(0)} fps · ${stats.ms.toFixed(0)} ms · ${stats.inliers} pts · ` +
-      `${boxes.filter((b) => !b.held).length} moving · ${boxes.filter((b) => b.held).length} held${note}`;
+      (settings.display === 'heatmap'
+        ? `${boxes.filter((b) => !b.held).length} moving${note}`
+        : `${boxes.filter((b) => !b.held).length} moving · ${boxes.filter((b) => b.held).length} held${note}`);
   }
-  if (!boxes.length || !video.videoWidth) return;
+  if (!video.videoWidth) return;
 
   // The video is drawn with object-fit: cover, so map frame coordinates the same way.
   const scale = Math.max(W / boxesFrame.w, H / boxesFrame.h);
   const offX = (W - boxesFrame.w * scale) / 2;
   const offY = (H - boxesFrame.h * scale) / 2;
   const dpr = window.devicePixelRatio || 1;
+
+  if (settings.display !== 'boxes' && heat) drawHeat(offX, offY, boxesFrame.w * scale, boxesFrame.h * scale);
+  if (settings.display === 'heatmap' || !boxes.length) return;
 
   // Small targets (a distant bird) still get a box big enough to see.
   const minSide = 20 * dpr;
@@ -318,6 +363,27 @@ function draw() {
     overlayCtx.strokeRect(x, y, w, h);
   }
   overlayCtx.setLineDash([]);
+}
+
+// Colours the heatmap and stretches it over the picture; smoothing while scaling it up gives the
+// soft glow.
+function drawHeat(x, y, w, h) {
+  if (heatCanvas.width !== heat.w || heatCanvas.height !== heat.h) {
+    heatCanvas.width = heat.w;
+    heatCanvas.height = heat.h;
+    heatImage = heatCtx.createImageData(heat.w, heat.h);
+  }
+  const px = heatImage.data;
+  for (let i = 0; i < heat.data.length; i++) {
+    const c = 4 * heat.data[i];
+    px[4 * i] = HEAT_COLORS[c];
+    px[4 * i + 1] = HEAT_COLORS[c + 1];
+    px[4 * i + 2] = HEAT_COLORS[c + 2];
+    px[4 * i + 3] = HEAT_COLORS[c + 3];
+  }
+  heatCtx.putImageData(heatImage, 0, 0);
+  overlayCtx.imageSmoothingEnabled = true;
+  overlayCtx.drawImage(heatCanvas, x, y, w, h);
 }
 
 // ---------- Boot ----------

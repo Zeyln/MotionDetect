@@ -93,12 +93,14 @@ function run(cv, defaultScene, k, c) {
     const camY = 100 + pan.y * f + 2 * Math.sin(f / 3); // a little hand shake
     let obj = null;
     let moving = false;
+    let scenePos = null;
     if (object) {
       const steps = object.stopAt == null ? f : Math.min(f, object.stopAt);
       moving = object.stopAt == null || f <= object.stopAt;
       const size = object.size || 40;
       const sceneX = 140 + object.vx * steps;
       const sceneY = 190;
+      scenePos = { x: sceneX, y: sceneY, size: object.size || 40 };
       obj = { x: (sceneX - camX) * k, y: (sceneY - camY) * k, s: size * k, contrast: size <= 8 };
     }
     const gain = exposureJump && f >= exposureJump.frame ? exposureJump.gain : 1;
@@ -112,10 +114,10 @@ function run(cv, defaultScene, k, c) {
     const t0 = performance.now();
     const r = det.processFrame(frame, 320 * k, 240 * k, f * FRAME_MS);
     ms += performance.now() - t0;
-    results.push({ ...r, f, obj, moving });
+    results.push({ ...r, f, obj, moving, camX, camY, scenePos });
   }
   det.dispose();
-  return { results: results.slice(5), ms: ms / frames }; // let the detector settle
+  return { results: results.slice(5), all: results, ms: ms / frames }; // let the detector settle
 }
 
 function contains(box, obj, slack) {
@@ -209,6 +211,74 @@ function contains(box, obj, slack) {
         }
         if (stopAt != null) assert.ok(heldOk >= afterStop - 1, 'box marked held once the object stops');
         if (c.options?.holdMs) assert.equal(lingering, 0, 'no boxes after the hold time');
+        console.log(`PASS  ${name}  (${summary})`);
+      } catch (e) {
+        failed++;
+        console.log(`FAIL  ${name}  (${summary})\n      ${e.message}`);
+      }
+    }
+  }
+  // ---------- Heatmap ----------
+  // Heat is reported at a quarter of the frame size. "Hot" means at least 64 of 255.
+  const HOT = 64;
+  const heatCases = [
+    { name: 'heatmap: panning camera, nothing moving', pan: panning },
+    { name: 'heatmap: panning camera, one-frame glitches', pan: panning, flicker: { every: 4 } },
+    { name: 'heatmap: panning camera, object moving', pan: panning, object: { vx: 6 } },
+    { name: 'heatmap: panning camera, fast small object', pan: panning, object: { vx: 16, size: 8 } },
+    // Fades within the fade time once the object stops (400 ms = 10 frames here).
+    { name: 'heatmap: object stops and fades', pan: panning, object: { vx: 6, stopAt: 14 } },
+  ];
+  for (const k of [1.5, 2]) {
+    for (const c of heatCases) {
+      const fadeMs = 400;
+      const { results, all, ms } = run(cv, scene, k, { ...c, options: { heatmap: true, heatFadeMs: fadeMs } });
+      let stray = 0; // frames with hot pixels away from where the object has been during the fade time
+      let onObject = 0; // frames (object moving and in view) where the object's centre is hot
+      let expectedOn = 0;
+      let notFaded = 0; // frames well after stopping where the object's spot is still hot
+      for (const r of results) {
+        const hm = r.heat;
+        const fw = (320 * k) / hm.w; // frame pixels per heatmap pixel
+        // Where the object has been within the fade time, in this frame's coordinates (scene-fixed).
+        const path = all
+          .filter((p) => p.scenePos && p.f <= r.f && (r.f - p.f) * FRAME_MS <= fadeMs + FRAME_MS)
+          .map((p) => ({
+            x: (p.scenePos.x - r.camX) * k,
+            y: (p.scenePos.y - r.camY) * k,
+            s: p.scenePos.size * k,
+          }));
+        const margin = 12 * k;
+        const nearPath = (x, y) =>
+          path.some((p) => x >= p.x - margin && x <= p.x + p.s + margin && y >= p.y - margin && y <= p.y + p.s + margin);
+        let strayHere = false;
+        for (let y = 0; y < hm.h && !strayHere; y++)
+          for (let x = 0; x < hm.w; x++)
+            if (hm.data[y * hm.w + x] >= HOT && !nearPath((x + 0.5) * fw, (y + 0.5) * fw)) {
+              strayHere = true;
+              break;
+            }
+        if (strayHere) stray++;
+        if (!r.obj) continue;
+        const cx = Math.floor((r.obj.x + r.obj.s / 2) / fw);
+        const cy = Math.floor((r.obj.y + r.obj.s / 2) / fw);
+        const inView = cx >= 0 && cy >= 0 && cx < hm.w && cy < hm.h;
+        if (!inView) continue;
+        const v = hm.data[cy * hm.w + cx];
+        if (r.moving) {
+          expectedOn++;
+          if (v >= HOT) onObject++;
+        }
+        const stopAt = c.object.stopAt;
+        if (stopAt != null && (r.f - stopAt) * FRAME_MS > fadeMs + 2 * FRAME_MS && v >= HOT) notFaded++;
+      }
+      const name = `${320 * k}px  ${c.name}`;
+      const summary = `stray=${stray}` + (c.object ? ` hotOnObject=${onObject}/${expectedOn}` : '') +
+        (c.object?.stopAt != null ? ` notFaded=${notFaded}` : '') + ` ${ms.toFixed(1)}ms/frame`;
+      try {
+        assert.ok(stray <= 1, 'no heat away from moving objects');
+        if (c.object) assert.ok(onObject >= expectedOn - 2, 'moving object is hot');
+        if (c.object?.stopAt != null) assert.equal(notFaded, 0, 'heat fades after the object stops');
         console.log(`PASS  ${name}  (${summary})`);
       } catch (e) {
         failed++;

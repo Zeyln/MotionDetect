@@ -1,6 +1,6 @@
 // Runs the detector off the main thread so the camera preview stays smooth.
 // Messages in:  {type:'config', options} | {type:'reset'} | {type:'frame', buffer, width, height}
-// Messages out: {type:'ready'} | {type:'error', message} | {type:'result', boxes, mode, features, inliers, ms}
+// Messages out: {type:'ready'} | {type:'error', message} | {type:'result', boxes, heat, mode, features, inliers, ms}
 'use strict';
 
 importScripts('vendor/opencv.js', 'detector.js');
@@ -33,7 +33,7 @@ onmessage = ({ data: msg }) => {
     const t0 = performance.now();
     try {
       const r = detector.processFrame(new Uint8ClampedArray(msg.buffer), msg.width, msg.height, t0);
-      postMessage({ type: 'result', ...r, ms: performance.now() - t0 });
+      postMessage({ type: 'result', ...r, ms: performance.now() - t0 }, r.heat ? [r.heat.data.buffer] : []);
     } catch (e) {
       // OpenCV.js throws numeric pointers for C++ exceptions.
       const message =

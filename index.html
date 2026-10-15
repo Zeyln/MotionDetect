@@ -34,7 +34,17 @@
     <label>Minimum size <output id="min-size-out"></output>
       <input id="min-size" type="range" min="1" max="10" step="1">
     </label>
-    <label>Keep boxes after stopping <output id="hold-out"></output>
+    <label>Display
+      <select id="display">
+        <option value="heatmap">Heatmap</option>
+        <option value="boxes">Boxes</option>
+        <option value="both">Heatmap and boxes</option>
+      </select>
+    </label>
+    <label id="heat-fade-row">Heat fade <output id="heat-fade-out"></output>
+      <input id="heat-fade" type="range" min="0.2" max="5" step="0.1">
+    </label>
+    <label id="hold-row">Keep boxes after stopping <output id="hold-out"></output>
       <input id="hold" type="range" min="0" max="10" step="0.5">
     </label>
     <label>Detail
@@ -51,7 +61,7 @@
 
   <div id="start-screen">
     <h1>MotionDetect</h1>
-    <p>Draws red boxes around anything moving in front of the camera, even while you move the phone.</p>
+    <p>Highlights anything moving in front of the camera, even while you move the phone.</p>
     <button id="start" type="button" disabled>Loading detector…</button>
     <p id="message" role="alert"></p>
   </div>

@@ -17,6 +17,10 @@
  *      When it stops moving it is kept as a "held" box for holdMs, carried along with the camera
  *      motion so it stays on the target while the phone moves.
  *
+ * Optionally (opts.heatmap) it also keeps a motion heatmap: confirmed motion pixels of each accepted
+ * blob are added as heat, which fades over heatFadeMs and is carried along with the camera motion so
+ * it stays where the motion happened. It is returned at a quarter of the frame size.
+ *
  * Kernel sizes, feature spacing and RANSAC tolerance are tuned for a 320 px frame and scale with
  * the frame size. The noise filter stays 3x3 at every size so small, thin movers survive.
  *
@@ -39,6 +43,8 @@
     minFeatures: 12,      // fewer tracked points than this: camera motion can't be trusted
     minSpreadCells: 5,    // camera-motion inliers must cover this many cells of a 4x4 grid
     maxRoundTrip: 1,      // px at 320 px: forward-backward tracking error allowed per point
+    heatmap: false,       // also build and return a motion heatmap
+    heatFadeMs: 1000,     // how long heat takes to fade away (it halves every quarter of this)
   };
 
   const odd = (n) => Math.max(3, 2 * Math.floor(n / 2) + 1);
@@ -66,6 +72,8 @@
     let nextId = 1;
     let rgba, gray, prevGray, prev2Gray, warped, warpedMin, warpedMax, above, motion, motion2, groups;
     let valid, warpedValid;
+    let heat, heatTmp, heatSrc, heatSmallF, heatSmall, heatBlur; // heatmap state, allocated with the frame
+    let lastHeatTime = null;
     let kernelOpen, kernelGrow;
     let scale = 1; // frame size relative to the 320 px the defaults are tuned for
     let pyramidLevels;
@@ -78,7 +86,7 @@
 
     function freeFrames() {
       const mats = [rgba, gray, prevGray, prev2Gray, warped, warpedMin, warpedMax, above, motion, motion2, groups,
-        valid, warpedValid];
+        valid, warpedValid, heat, heatTmp, heatSrc, heatSmallF, heatSmall];
       for (const m of [...mats, kernelOpen, kernelGrow]) {
         if (m) m.delete();
       }
@@ -101,6 +109,12 @@
       warped = new cv.Mat(h, w, cv.CV_8UC1);
       motion = new cv.Mat(h, w, cv.CV_8UC1);
       motion2 = new cv.Mat(h, w, cv.CV_8UC1);
+      heat = new cv.Mat(h, w, cv.CV_32FC1, new cv.Scalar(0));
+      heatTmp = new cv.Mat(h, w, cv.CV_32FC1);
+      heatSrc = new cv.Mat(h, w, cv.CV_8UC1);
+      heatSmallF = new cv.Mat();
+      heatSmall = new cv.Mat();
+      heatBlur = new cv.Size(odd(7 * scale), odd(7 * scale));
       groups = new cv.Mat(h, w, cv.CV_8UC1);
       valid = new cv.Mat(h, w, cv.CV_8UC1, new cv.Scalar(255));
       warpedValid = new cv.Mat(h, w, cv.CV_8UC1);
@@ -115,6 +129,8 @@
       frameCount = 0;
       lastMotion = null;
       tracks = [];
+      lastHeatTime = null;
+      if (heat) heat.setTo(new cv.Scalar(0));
     }
 
     // Returns { H, features, inliers } where H maps prevGray -> gray, or H = null if tracking failed.
@@ -433,7 +449,7 @@
       if (!H) {
         // Can't tell where the camera went; leave held boxes where they are until it settles.
         advance(null);
-        return { boxes: reportTracks(now), mode: 'lost', features, inliers };
+        return { boxes: reportTracks(now), heat: updateHeat(null, null, false, now), mode: 'lost', features, inliers };
       }
       const m1 = H === identity ? IDENTITY : H.data64F.slice();
       if (H !== identity) H.delete();
@@ -460,10 +476,64 @@
       advance(m1);
 
       if (cv.countNonZero(groups) > opts.maxChangedArea * width * height) {
-        return { boxes: reportTracks(now), mode: 'noisy', features, inliers };
+        return { boxes: reportTracks(now), heat: updateHeat(m1, null, false, now), mode: 'noisy', features, inliers };
       }
       updateTracks(findBoxes(twoStep), now);
-      return { boxes: reportTracks(now), mode: 'ok', features, inliers };
+      // Heat comes only from confirmed targets seen this frame, so it gets the tracker's noise
+      // filtering: blips that never reach minHits sightings add no heat.
+      const seen = tracks.filter((t) => t.hits >= opts.minHits && t.lastSeen === now);
+      const heatMap = updateHeat(m1, seen, twoStep, now);
+      return { boxes: reportTracks(now), heat: heatMap, mode: 'ok', features, inliers };
+    }
+
+    /**
+     * Fades the heatmap, moves it with camera motion `m` (if known), and adds the motion pixels inside
+     * `targets` (boxes of confirmed targets seen this frame; two-step pixels when `twoStep`). Returns it at a quarter of
+     * the frame size as { w, h, data: Uint8Array }, or null if the heatmap is off.
+     */
+    function updateHeat(m, targets, twoStep, now) {
+      if (!opts.heatmap) return null;
+      const dt = lastHeatTime === null ? 0 : now - lastHeatTime;
+      lastHeatTime = now;
+      const size = new cv.Size(width, height);
+
+      if (m && m !== IDENTITY) {
+        const M = cv.matFromArray(3, 3, cv.CV_64F, m);
+        cv.warpPerspective(heat, heatTmp, M, size, cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar(0));
+        M.delete();
+        heatTmp.copyTo(heat);
+      }
+      const decay = opts.heatFadeMs > 0 ? Math.pow(0.5, dt / (opts.heatFadeMs / 4)) : 0;
+      heat.convertTo(heat, -1, decay, 0);
+
+      if (targets && targets.length) {
+        const source = twoStep ? motion2 : motion;
+        heatSrc.setTo(new cv.Scalar(0));
+        for (const t of targets) {
+          const x = Math.max(0, Math.round(t.x));
+          const y = Math.max(0, Math.round(t.y));
+          const w = Math.min(width, Math.round(t.x + t.w)) - x;
+          const h = Math.min(height, Math.round(t.y + t.h)) - y;
+          if (w <= 0 || h <= 0) continue;
+          const r = new cv.Rect(x, y, w, h);
+          const from = source.roi(r);
+          const to = heatSrc.roi(r);
+          from.copyTo(to);
+          from.delete();
+          to.delete();
+        }
+        // Fill in sparse edge pixels and soften the blob into a glow.
+        cv.dilate(heatSrc, heatSrc, kernelGrow);
+        cv.blur(heatSrc, heatSrc, heatBlur);
+        heatSrc.convertTo(heatTmp, cv.CV_32F, 1, 0);
+        cv.max(heat, heatTmp, heat);
+      }
+
+      const sw = Math.max(1, Math.round(width / 4));
+      const sh = Math.max(1, Math.round(height / 4));
+      cv.resize(heat, heatSmallF, new cv.Size(sw, sh), 0, 0, cv.INTER_AREA);
+      heatSmallF.convertTo(heatSmall, cv.CV_8U, 1, 0);
+      return { w: sw, h: sh, data: new Uint8Array(heatSmall.data) };
     }
 
     // Shifts the frame history: current -> prev -> prev2. `m` is the camera motion prev -> current,
