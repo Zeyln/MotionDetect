@@ -65,4 +65,5 @@ On the phone, tap **Start camera** and allow camera access. To install it like a
 - **Minimum size** ignores small blobs such as leaves or noise. At the default (3), anything about 6×6 px in the processed frame counts; lower it to catch even smaller specks.
 - **Keep boxes after stopping** sets how long a box stays on a target after it stops moving (0–10 s, default 3 s; 0 turns holding off). Held boxes are dashed.
 - **Detail** sets the processing resolution (long side). Higher resolution catches smaller or more distant movement but uses more battery. The default is High (800 px). If **Show stats** reports under about 20 fps, step down a level.
+- **Sync video with boxes** (on by default) shows each analysed frame together with its boxes, so they line up exactly with the picture. The picture then runs one frame behind the live camera and updates at the detector's frame rate (the fps in **Show stats**). Turn it off for the smoother live picture, with boxes trailing fast movers slightly.
 - **Show stats** shows fps, per-frame time, the number of background points used for camera tracking, and how many targets are moving and held.

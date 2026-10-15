@@ -9,15 +9,19 @@ const hud = $('hud');
 const startBtn = $('start');
 const message = $('message');
 
-// Downscaled copy of each camera frame that gets sent to the detector.
+// Full-resolution copy of the frame being analysed, shown on screen with its boxes when the video
+// is synced; the detector gets a downscaled copy of the same frame.
+const frame = document.createElement('canvas');
+const frameCtx = frame.getContext('2d');
 const grab = document.createElement('canvas');
 const grabCtx = grab.getContext('2d', { willReadFrequently: true });
+let frameReady = false; // `frame` holds a captured picture (reset when the camera starts)
 
 const SETTINGS_KEY = 'motiondetect.settings';
 // Bump when a default changes in a way that should override what's saved on the phone.
 const SETTINGS_VERSION = 2;
 const settings = Object.assign(
-  { sensitivity: 6, minSize: 3, holdSeconds: 3, detail: 800, showStats: false, facing: 'environment' },
+  { sensitivity: 6, minSize: 3, holdSeconds: 3, detail: 800, syncVideo: true, showStats: false, facing: 'environment' },
   loadSettings(),
   { version: SETTINGS_VERSION }
 );
@@ -73,8 +77,11 @@ function applySettings() {
   $('hold').value = settings.holdSeconds;
   $('hold-out').textContent = settings.holdSeconds ? settings.holdSeconds + ' s' : 'off';
   $('detail').value = String(settings.detail);
+  $('sync-video').checked = settings.syncVideo;
   $('show-stats').checked = settings.showStats;
   hud.hidden = !settings.showStats || !running;
+  // Synced: the live <video> is hidden and the analysed frames are drawn on the canvas instead.
+  stage.classList.toggle('synced', settings.syncVideo);
   if (worker) worker.postMessage({ type: 'config', options: detectorOptions() });
 }
 
@@ -84,8 +91,10 @@ $('settings').addEventListener('input', () => {
   settings.holdSeconds = Number($('hold').value);
   settings.detail = Number($('detail').value);
   settings.showStats = $('show-stats').checked;
+  settings.syncVideo = $('sync-video').checked;
   saveSettings();
   applySettings();
+  draw();
 });
 
 $('settings-btn').addEventListener('click', () => {
@@ -115,6 +124,7 @@ function startWorker() {
     } else if (msg.type === 'error') {
       inFlight = false;
       console.error('Detector error:', msg.message);
+      draw(); // keep the synced picture moving even if one frame failed
     }
   };
   worker.onerror = (e) => {
@@ -156,6 +166,7 @@ async function startCamera() {
   stage.classList.toggle('mirrored', settings.facing === 'user');
   running = true;
   boxes = [];
+  frameReady = false;
   worker.postMessage({ type: 'reset' });
   $('start-screen').hidden = true;
   $('controls').hidden = false;
@@ -224,7 +235,19 @@ function sendFrame() {
     grab.width = w;
     grab.height = h;
   }
-  grabCtx.drawImage(video, 0, 0, w, h);
+  if (settings.syncVideo) {
+    // Snapshot the frame once, then downscale from the snapshot, so the picture shown later is
+    // exactly the one the boxes come from.
+    if (frame.width !== vw || frame.height !== vh) {
+      frame.width = vw;
+      frame.height = vh;
+    }
+    frameCtx.drawImage(video, 0, 0, vw, vh);
+    frameReady = true;
+    grabCtx.drawImage(frame, 0, 0, w, h);
+  } else {
+    grabCtx.drawImage(video, 0, 0, w, h);
+  }
   const { data } = grabCtx.getImageData(0, 0, w, h);
   boxesFrame = { w, h };
   inFlight = true;
@@ -255,6 +278,16 @@ function draw() {
   const W = overlay.width;
   const H = overlay.height;
   overlayCtx.clearRect(0, 0, W, H);
+
+  // Synced: show the analysed frame itself (cropped to fill the screen like the live video), so
+  // the boxes line up with the picture. It is one frame behind live and updates at the detector's
+  // frame rate.
+  if (settings.syncVideo && running && frameReady) {
+    const fit = Math.max(W / frame.width, H / frame.height);
+    const fw = frame.width * fit;
+    const fh = frame.height * fit;
+    overlayCtx.drawImage(frame, (W - fw) / 2, (H - fh) / 2, fw, fh);
+  }
 
   if (settings.showStats && running) {
     const note = lastMode === 'lost' ? ' · moving too fast' : lastMode === 'noisy' ? ' · unstable' : '';

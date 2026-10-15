@@ -36,6 +36,8 @@ html, body {
   height: 100%;
 }
 #cam { object-fit: cover; }
+/* Synced: the canvas shows the analysed frames; the live video keeps running underneath. */
+#stage.synced #cam { opacity: 0; }
 #overlay { pointer-events: none; }
 
 #hud {
