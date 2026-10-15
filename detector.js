@@ -2,13 +2,18 @@
  * Motion detector that compensates for camera movement, built on OpenCV.js.
  *
  * Per frame:
- *   1. Track corner features from the previous frame into the current one (Lucas-Kanade).
+ *   1. Track corner features from the previous frame into the current one (Lucas-Kanade), then
+ *      back again, keeping only points that return to where they started.
  *   2. Fit a homography to those matches with RANSAC. Background points dominate, so this
  *      is the camera's own motion; points on moving objects get rejected as outliers.
- *   3. Warp the previous frame onto the current one and take the absolute difference.
- *      Whatever still differs moved independently of the camera.
- *   4. Threshold, clean up with morphology, and return bounding boxes of the blobs.
+ *   3. Warp the previous frame onto the current one, match its brightness (auto exposure), and
+ *      take the absolute difference. Whatever still differs moved independently of the camera.
+ *   4. Threshold and clean up with morphology. Nearby blobs are grouped using a dilated copy of
+ *      the mask, but each box is fitted to the undilated pixels so it hugs the object.
  *   5. Only report boxes that were also seen in the previous frame(s), to suppress flicker.
+ *
+ * Pixel sizes (kernels, feature spacing, RANSAC tolerance) are tuned for a 320 px frame and
+ * scale with the frame size, so behaviour stays the same at any processing resolution.
  *
  * Works in a Web Worker (global `createDetector`) and in Node (module.exports) for tests.
  */
@@ -20,11 +25,13 @@
     minArea: 0.002,       // smallest blob to report, as a fraction of the frame area
     maxChangedArea: 0.4,  // if more than this fraction changed, motion estimate is bad: report nothing
     minHits: 2,           // consecutive frames a box must appear in before it is reported
-    maxCorners: 300,
+    maxCorners: 300,      // at 320 px; scales with frame size up to 400
     minFeatures: 12,      // fewer tracked points than this: camera motion can't be trusted
     minSpreadCells: 5,    // camera-motion inliers must cover this many cells of a 4x4 grid
-    blur: 5,
+    maxRoundTrip: 1,      // px at 320 px: forward-backward tracking error allowed per point
   };
+
+  const odd = (n) => Math.max(3, 2 * Math.floor(n / 2) + 1);
 
   function createDetector(cv, options) {
     const opts = Object.assign({}, DEFAULTS, options);
@@ -33,28 +40,38 @@
     let height = 0;
     let hasPrev = false;
     let prevBoxes = [];
-    let rgba, gray, prevGray, warped, diff, valid, warpedValid;
+    let rgba, gray, prevGray, warped, motion, groups, valid, warpedValid, kernelOpen, kernelGrow;
+    let scale = 1; // frame size relative to the 320 px the defaults are tuned for
+    let pyramidLevels;
 
     const empty = new cv.Mat();
     const identity = cv.Mat.eye(3, 3, cv.CV_64F);
-    const kernelOpen = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
-    const kernelGrow = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(7, 7));
     const winSize = new cv.Size(21, 21);
+    const blurSize = new cv.Size(5, 5);
     const criteria = new cv.TermCriteria(cv.TermCriteria_EPS | cv.TermCriteria_COUNT, 20, 0.03);
 
     function freeFrames() {
-      for (const m of [rgba, gray, prevGray, warped, diff, valid, warpedValid]) if (m) m.delete();
+      for (const m of [rgba, gray, prevGray, warped, motion, groups, valid, warpedValid, kernelOpen, kernelGrow]) {
+        if (m) m.delete();
+      }
     }
 
     function allocate(w, h) {
       freeFrames();
       width = w;
       height = h;
+      scale = Math.max(w, h) / 320;
+      pyramidLevels = Math.round(3 + Math.log2(Math.max(1, scale)));
+      // Rectangular kernels: several times faster than elliptical ones in OpenCV.js, and the shape
+      // doesn't matter since boxes are fitted to the exact motion pixels afterwards.
+      kernelOpen = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(odd(3 * scale), odd(3 * scale)));
+      kernelGrow = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(odd(7 * scale), odd(7 * scale)));
       rgba = new cv.Mat(h, w, cv.CV_8UC4);
       gray = new cv.Mat(h, w, cv.CV_8UC1);
       prevGray = new cv.Mat(h, w, cv.CV_8UC1);
       warped = new cv.Mat(h, w, cv.CV_8UC1);
-      diff = new cv.Mat(h, w, cv.CV_8UC1);
+      motion = new cv.Mat(h, w, cv.CV_8UC1);
+      groups = new cv.Mat(h, w, cv.CV_8UC1);
       valid = new cv.Mat(h, w, cv.CV_8UC1, new cv.Scalar(255));
       warpedValid = new cv.Mat(h, w, cv.CV_8UC1);
       reset();
@@ -70,19 +87,28 @@
     function estimateCameraMotion() {
       const corners = new cv.Mat();
       const next = new cv.Mat();
+      const back = new cv.Mat();
       const status = new cv.Mat();
+      const backStatus = new cv.Mat();
       const err = new cv.Mat();
       try {
-        cv.goodFeaturesToTrack(prevGray, corners, opts.maxCorners, 0.01, 7, empty, 7, false, 0.04);
+        const maxCorners = Math.min(400, Math.round(opts.maxCorners * scale));
+        const spacing = Math.max(5, Math.round(7 * scale));
+        cv.goodFeaturesToTrack(prevGray, corners, maxCorners, 0.01, spacing, empty, 7, false, 0.04);
         // Too little texture to track (blank wall, darkness). Assume a still camera.
         if (corners.rows < opts.minFeatures) return { H: identity, features: corners.rows, inliers: 0 };
 
-        cv.calcOpticalFlowPyrLK(prevGray, gray, corners, next, status, err, winSize, 3, criteria);
+        cv.calcOpticalFlowPyrLK(prevGray, gray, corners, next, status, err, winSize, pyramidLevels, criteria);
+        cv.calcOpticalFlowPyrLK(gray, prevGray, next, back, backStatus, err, winSize, pyramidLevels, criteria);
 
+        const maxRoundTrip = opts.maxRoundTrip * scale;
         const src = [];
         const dst = [];
         for (let i = 0; i < status.rows; i++) {
-          if (status.data[i] !== 1) continue;
+          if (status.data[i] !== 1 || backStatus.data[i] !== 1) continue;
+          const dx = back.data32F[2 * i] - corners.data32F[2 * i];
+          const dy = back.data32F[2 * i + 1] - corners.data32F[2 * i + 1];
+          if (dx * dx + dy * dy > maxRoundTrip * maxRoundTrip) continue;
           src.push(corners.data32F[2 * i], corners.data32F[2 * i + 1]);
           dst.push(next.data32F[2 * i], next.data32F[2 * i + 1]);
         }
@@ -92,7 +118,7 @@
         const srcMat = cv.matFromArray(tracked, 1, cv.CV_32FC2, src);
         const dstMat = cv.matFromArray(tracked, 1, cv.CV_32FC2, dst);
         const inlierMask = new cv.Mat();
-        const H = cv.findHomography(srcMat, dstMat, cv.RANSAC, 3, inlierMask);
+        const H = cv.findHomography(srcMat, dstMat, cv.RANSAC, 2 * scale, inlierMask, 2000, 0.995);
         let inliers = 0;
         let cells = 0;
         if (!H.empty()) ({ inliers, cells } = inlierSpread(inlierMask, dst));
@@ -115,7 +141,9 @@
       } finally {
         corners.delete();
         next.delete();
+        back.delete();
         status.delete();
+        backStatus.delete();
         err.delete();
       }
     }
@@ -148,21 +176,41 @@
       return true;
     }
 
+    // Groups come from the dilated mask; each box is then shrunk to the motion pixels inside it.
     function findBoxes() {
       const contours = new cv.MatVector();
       const hierarchy = new cv.Mat();
-      cv.findContours(diff, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      cv.findContours(groups, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
       const minPx = opts.minArea * width * height;
       const boxes = [];
       for (let i = 0; i < contours.size(); i++) {
         const c = contours.get(i);
-        const r = cv.boundingRect(c);
+        const g = cv.boundingRect(c);
         c.delete();
-        if (r.width * r.height >= minPx) boxes.push({ x: r.x, y: r.y, w: r.width, h: r.height });
+        const r = motionBounds(g);
+        if (r && r.w * r.h >= minPx) boxes.push(r);
       }
       contours.delete();
       hierarchy.delete();
-      return mergeBoxes(boxes, Math.round(0.02 * Math.max(width, height)));
+      return mergeBoxes(boxes, 0);
+    }
+
+    // Bounding box of the motion pixels inside rect g, or null if there are none.
+    // (This OpenCV.js build has no findNonZero.)
+    function motionBounds(g) {
+      const px = motion.data;
+      let minX = Infinity, minY = Infinity, maxX = -1, maxY = -1;
+      for (let y = g.y; y < g.y + g.height; y++) {
+        const row = y * width;
+        for (let x = g.x; x < g.x + g.width; x++) {
+          if (!px[row + x]) continue;
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          maxY = y;
+        }
+      }
+      return maxX < 0 ? null : { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
     }
 
     // Each box inherits the hit count of the previous boxes it overlaps, plus one.
@@ -184,7 +232,7 @@
       if (w !== width || h !== height) allocate(w, h);
       rgba.data.set(data);
       cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY);
-      if (opts.blur > 1) cv.GaussianBlur(gray, gray, new cv.Size(opts.blur, opts.blur), 0);
+      cv.GaussianBlur(gray, gray, blurSize, 0); // 5x5 at any size; larger kernels are far slower here
 
       if (!hasPrev) {
         gray.copyTo(prevGray);
@@ -207,19 +255,31 @@
       cv.erode(warpedValid, warpedValid, kernelGrow);
       if (H !== identity) H.delete();
 
-      cv.absdiff(gray, warped, diff);
-      cv.threshold(diff, diff, opts.threshold, 255, cv.THRESH_BINARY);
-      cv.bitwise_and(diff, warpedValid, diff);
-      cv.morphologyEx(diff, diff, cv.MORPH_OPEN, kernelOpen);
-      cv.dilate(diff, diff, kernelGrow, new cv.Point(-1, -1), 2);
+      matchBrightness();
+
+      cv.absdiff(gray, warped, motion);
+      cv.threshold(motion, motion, opts.threshold, 255, cv.THRESH_BINARY);
+      cv.bitwise_and(motion, warpedValid, motion);
+      cv.morphologyEx(motion, motion, cv.MORPH_OPEN, kernelOpen);
+      cv.dilate(motion, groups, kernelGrow, new cv.Point(-1, -1), 2);
 
       gray.copyTo(prevGray);
 
-      if (cv.countNonZero(diff) > opts.maxChangedArea * width * height) {
+      if (cv.countNonZero(groups) > opts.maxChangedArea * width * height) {
         prevBoxes = [];
         return { boxes: [], mode: 'noisy', features, inliers };
       }
       return { boxes: confirm(findBoxes()), mode: 'ok', features, inliers };
+    }
+
+    // Phones adjust exposure as the scene changes, brightening or darkening the whole frame.
+    // Scale the warped previous frame so its average brightness matches the current one.
+    function matchBrightness() {
+      const before = cv.mean(warped, warpedValid)[0];
+      const now = cv.mean(gray, warpedValid)[0];
+      if (before < 1) return;
+      const gain = now / before;
+      if (Math.abs(gain - 1) > 0.01) warped.convertTo(warped, -1, gain, 0);
     }
 
     function configure(next) {
@@ -228,7 +288,7 @@
 
     function dispose() {
       freeFrames();
-      for (const m of [empty, identity, kernelOpen, kernelGrow]) m.delete();
+      for (const m of [empty, identity]) m.delete();
     }
 
     return { processFrame, configure, reset, dispose, options: opts };

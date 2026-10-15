@@ -14,9 +14,12 @@ const grab = document.createElement('canvas');
 const grabCtx = grab.getContext('2d', { willReadFrequently: true });
 
 const SETTINGS_KEY = 'motiondetect.settings';
+// Bump when a default changes in a way that should override what's saved on the phone.
+const SETTINGS_VERSION = 2;
 const settings = Object.assign(
-  { sensitivity: 6, minSize: 3, detail: 320, showStats: false, facing: 'environment' },
-  loadSettings()
+  { sensitivity: 6, minSize: 3, detail: 800, showStats: false, facing: 'environment' },
+  loadSettings(),
+  { version: SETTINGS_VERSION }
 );
 
 let worker = null;
@@ -34,7 +37,10 @@ const stats = { frames: 0, since: performance.now(), fps: 0, ms: 0, inliers: 0 }
 
 function loadSettings() {
   try {
-    return JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {};
+    const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {};
+    // Version 1 stored `detail` as frame width; it is now the long side, with new options.
+    if (saved.version !== SETTINGS_VERSION) delete saved.detail;
+    return saved;
   } catch {
     return {};
   }
@@ -204,8 +210,10 @@ function onFrame() {
 }
 
 function sendFrame() {
-  const w = settings.detail;
-  const h = Math.round((w * video.videoHeight) / video.videoWidth);
+  // `detail` is the long side, so portrait and landscape process the same number of pixels.
+  const { videoWidth: vw, videoHeight: vh } = video;
+  const w = vw >= vh ? settings.detail : Math.round((settings.detail * vw) / vh);
+  const h = vw >= vh ? Math.round((settings.detail * vh) / vw) : settings.detail;
   if (grab.width !== w || grab.height !== h) {
     grab.width = w;
     grab.height = h;
