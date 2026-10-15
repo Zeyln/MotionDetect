@@ -20,50 +20,67 @@
     <canvas id="overlay"></canvas>
   </div>
 
-  <div id="hud" hidden></div>
+  <div id="ui" hidden>
+    <div id="top">
+      <div id="hud" hidden></div>
+      <div id="status" hidden></div>
+      <div class="top-buttons">
+        <button id="stats-btn" class="pill" type="button" aria-pressed="false">Stats</button>
+        <button id="flip" class="pill" type="button" aria-label="Switch camera">Flip</button>
+      </div>
+    </div>
 
-  <div id="controls" hidden>
-    <button id="flip" type="button" aria-label="Switch camera">Flip</button>
-    <button id="settings-btn" type="button" aria-label="Settings" aria-expanded="false">Settings</button>
+    <div id="hint" hidden>Tap the picture to hide the controls</div>
+
+    <div id="panel">
+      <div id="detect-controls">
+        <div class="segmented" id="view" role="radiogroup" aria-label="Show motion as">
+          <button type="button" data-value="heatmap">Heatmap</button>
+          <button type="button" data-value="outline">Outline</button>
+          <button type="button" data-value="both">Both</button>
+        </div>
+        <label class="slider"><span>Sensitivity</span>
+          <input id="sensitivity" type="range" min="1" max="10" step="1"><output id="sensitivity-out"></output>
+        </label>
+        <label class="slider"><span>Min size</span>
+          <input id="min-size" type="range" min="1" max="10" step="1"><output id="min-size-out"></output>
+        </label>
+        <label class="slider"><span>Fade</span>
+          <input id="heat-fade" type="range" min="0.2" max="10" step="0.1"><output id="heat-fade-out"></output>
+        </label>
+        <div class="buttons">
+          <button id="detail" class="pill" type="button">Detail: High</button>
+          <button id="sync" class="pill" type="button" aria-pressed="true">Sync video</button>
+        </div>
+      </div>
+
+      <div id="extract-controls">
+        <div class="chips" id="effects" role="radiogroup" aria-label="Effect"></div>
+        <p id="effect-about"></p>
+        <label class="slider"><span>Delay</span>
+          <input id="delay" type="range" min="1" max="30" step="1"><output id="delay-out"></output>
+        </label>
+        <label class="slider" id="strength-row"><span id="strength-label">Strength</span>
+          <input id="strength" type="range" min="1" max="5" step="1"><output id="strength-out"></output>
+        </label>
+      </div>
+
+      <div class="segmented big" id="mode" role="radiogroup" aria-label="Mode">
+        <button type="button" data-value="detect">Detect</button>
+        <button type="button" data-value="extract">Extract</button>
+      </div>
+    </div>
   </div>
-
-  <form id="settings" hidden>
-    <label>Sensitivity <output id="sensitivity-out"></output>
-      <input id="sensitivity" type="range" min="1" max="10" step="1">
-    </label>
-    <label>Minimum size <output id="min-size-out"></output>
-      <input id="min-size" type="range" min="1" max="10" step="1">
-    </label>
-    <label>Display
-      <select id="display">
-        <option value="heatmap">Heatmap</option>
-        <option value="outline">Outline</option>
-        <option value="both">Heatmap and outline</option>
-      </select>
-    </label>
-    <label>Fade time <output id="heat-fade-out"></output>
-      <input id="heat-fade" type="range" min="0.2" max="10" step="0.1">
-    </label>
-    <label>Detail
-      <select id="detail">
-        <option value="480">Fast (480 px)</option>
-        <option value="640">Normal (640 px)</option>
-        <option value="800">High (800 px)</option>
-        <option value="960">Max (960 px)</option>
-      </select>
-    </label>
-    <label class="check"><input id="sync-video" type="checkbox"> Sync video with boxes</label>
-    <label class="check"><input id="show-stats" type="checkbox"> Show stats</label>
-  </form>
 
   <div id="start-screen">
     <h1>MotionDetect</h1>
     <p>Highlights anything moving in front of the camera, even while you move the phone.</p>
-    <button id="start" type="button" disabled>Loading detector…</button>
+    <button id="start" type="button">Start camera</button>
     <p id="message" role="alert"></p>
   </div>
 
   <script src="outline.js"></script>
+  <script src="effects.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

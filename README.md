@@ -54,21 +54,42 @@ On the phone, tap **Start camera** and allow camera access. To install it like a
 
 | File | Role |
 | --- | --- |
-| `index.html`, `styles.css` | Full-screen camera view, controls, settings sheet |
-| `app.js` | Camera, frame capture, worker messaging, heatmap and outline drawing, settings |
+| `index.html`, `styles.css` | Full-screen camera view and the on-screen controls |
+| `app.js` | Camera, controls, modes, frame loop, detector worker (Detect only), heatmap and outline drawing |
 | `outline.js` | Traces the heatmap's outline (marching squares) and labels its areas |
+| `effects.js` | Extract mode: frame history and the time-difference effects |
 | `worker.js` | Loads OpenCV.js and runs the detector off the main thread |
 | `detector.js` | The motion-compensated detection pipeline |
 | `sw.js`, `manifest.webmanifest`, `icons/` | PWA install and offline support |
 | `serve.js` | Dependency-free local static server |
 | `test/detector.test.js` | Tests at 480 and 640 px with sensor noise: still/panning camera × object/no object, a plain-wall scene, a sudden exposure change, a tiny object, a fast small object (no trail of boxes), a fast object that stops dead (no box running ahead), one-frame glitches, the heatmap (no stray heat, heat on movers, fading after a stop), targets that stop (held boxes, also while panning), hold expiry, and box tightness |
 
-## Tuning
+## Controls
 
-- **Sensitivity** lowers the brightness difference that counts as motion. Raise it to catch subtle movement; lower it if lighting flicker causes false boxes.
-- **Minimum size** ignores small blobs such as leaves or noise. At the default (3), anything about 6×6 px in the processed frame counts; lower it to catch even smaller specks.
-- **Display** chooses **Heatmap** (default), **Outline**, or **Heatmap and outline**.
-- **Fade time** sets how long heat, and with it the outline, takes to fade after motion stops (0.2–10 s, default 1 s). Short values show only what's moving now; long ones keep marking where things moved or stopped.
-- **Detail** sets the processing resolution (long side). Higher resolution catches smaller or more distant movement but uses more battery. The default is High (800 px). If **Show stats** reports under about 20 fps, step down a level.
-- **Sync video with boxes** (on by default) shows each analysed frame together with its boxes, so they line up exactly with the picture. The picture then runs one frame behind the live camera and updates at the detector's frame rate (the fps in **Show stats**). Turn it off for the smoother live picture, with boxes trailing fast movers slightly.
-- **Show stats** shows fps, per-frame time, the number of background points used for camera tracking, and how many targets are moving.
+Everything is on screen. Tap the picture to hide the bottom controls for a clean view, and tap again to bring them back.
+
+- **Stats** and **Flip** (top right) show the frame rate and other numbers, and switch between the back and front camera.
+- **Detect | Extract** (bottom) switches between the two modes.
+
+### Detect: the motion detector
+
+- **Heatmap | Outline | Both** sets how motion is shown.
+- **Sensitivity** lowers the brightness difference that counts as motion. Raise it to catch subtle movement; lower it if lighting flicker causes false detections.
+- **Min size** ignores small blobs such as leaves or noise. At 3, anything about 6×6 px in the processed frame counts; lower it to catch even smaller specks.
+- **Fade** sets how long heat, and with it the outline, takes to fade after motion stops (0.2–10 s).
+- **Detail** cycles the processing resolution (long side): Fast 480, Normal 640, High 800, Max 960 px. Higher catches smaller or more distant movement but costs frame rate and battery. If **Stats** shows under about 20 fps, step down.
+- **Sync video** (on by default) shows each analysed frame together with its heat, so they line up exactly. The picture then runs one frame behind live, at the detector's frame rate. Off gives the smoother live picture, with the heat trailing fast movers slightly.
+
+### Extract: time-difference effects
+
+These compare the live picture with itself a moment ago. They are pure canvas blending done by the graphics chip (`effects.js`): the detector and OpenCV are not loaded at all in this mode. The last 30 frames are kept at 720 px.
+
+- **Inverted overlay**: the "motion extraction" trick. A half-transparent, inverted copy of an earlier frame over the live one; still areas cancel to flat grey and movement shows as light and dark edges. *Contrast* pushes the result away from grey.
+- **Difference**: the live frame minus the earlier one; still areas go black, movers glow in their own colours. *Gain* brightens it.
+- **Exclusion**: an exclusion blend of the two; still areas get a washed-out inverted look and movers flash in other colours.
+- **Colour split**: red from now, green from *Delay* ago, blue from twice that; still things keep their colours, movers get rainbow fringes.
+- **Thermal**: how much each spot changed, in heat colours over a dimmed picture. *Gain* sets how little change is needed to glow.
+- **Trails**: frame-to-frame change is added onto a slowly fading layer, like a long exposure. *Trail length* sets how slowly it fades.
+- **Echo**: earlier frames laid over the live one at falling opacity, so movers leave fading copies. *Copies* sets how many.
+
+**Delay** (1–30 frames, shown in ms) sets how far back the earlier frame is. Short delays show only fast movement as thin edges; long ones show slower movement and wider ghosts. These effects don't compensate for the phone moving, so they work best with the phone held still or on a stand.
