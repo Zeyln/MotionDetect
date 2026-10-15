@@ -1,0 +1,10 @@
+{
+  "name": "motiondetect",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Phone web app that boxes moving objects in the camera view, compensating for camera motion.",
+  "scripts": {
+    "start": "node serve.js",
+    "test": "node test/detector.test.js"
+  }
+}

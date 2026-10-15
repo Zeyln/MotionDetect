@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#000000">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="MotionDetect">
+  <title>MotionDetect</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png" type="image/png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="stage">
+    <video id="cam" playsinline muted autoplay></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="hud" hidden></div>
+
+  <div id="controls" hidden>
+    <button id="flip" type="button" aria-label="Switch camera">Flip</button>
+    <button id="settings-btn" type="button" aria-label="Settings" aria-expanded="false">Settings</button>
+  </div>
+
+  <form id="settings" hidden>
+    <label>Sensitivity <output id="sensitivity-out"></output>
+      <input id="sensitivity" type="range" min="1" max="10" step="1">
+    </label>
+    <label>Minimum size <output id="min-size-out"></output>
+      <input id="min-size" type="range" min="1" max="10" step="1">
+    </label>
+    <label>Detail
+      <select id="detail">
+        <option value="240">Fast (240 px)</option>
+        <option value="320">Normal (320 px)</option>
+        <option value="480">High (480 px)</option>
+      </select>
+    </label>
+    <label class="check"><input id="show-stats" type="checkbox"> Show stats</label>
+  </form>
+
+  <div id="start-screen">
+    <h1>MotionDetect</h1>
+    <p>Draws red boxes around anything moving in front of the camera, even while you move the phone.</p>
+    <button id="start" type="button" disabled>Loading detector…</button>
+    <p id="message" role="alert"></p>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
