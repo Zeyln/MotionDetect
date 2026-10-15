@@ -57,6 +57,8 @@ const settings = Object.assign(
 let worker = null;
 let workerReady = false;
 let inFlight = false;
+let lastSentFrame = null; // id of the last camera frame sent, so the same picture is never analysed twice
+let lastChecksum = null; // fallback when the browser has no frame counter (Firefox): compare content
 let stream = null;
 let running = false;
 let wakeLock = null;
@@ -160,10 +162,12 @@ function startWorker() {
       stats.inliers = msg.inliers;
       countFrame();
       draw();
+      sendIfNewFrame(); // don't wait for the next display refresh if a new frame is already there
     } else if (msg.type === 'error') {
       inFlight = false;
       console.error('Detector error:', msg.message);
       draw(); // keep the synced picture moving even if one frame failed
+      sendIfNewFrame();
     }
   };
   worker.onerror = (e) => {
@@ -207,6 +211,8 @@ async function startCamera() {
   boxes = [];
   heat = null;
   frameReady = false;
+  lastSentFrame = null;
+  lastChecksum = null;
   worker.postMessage({ type: 'reset' });
   $('start-screen').hidden = true;
   $('controls').hidden = false;
@@ -261,12 +267,37 @@ function scheduleFrame() {
 
 function onFrame() {
   if (running !== true) return;
-  // Drop frames while the detector is busy so boxes never lag behind the picture.
-  if (workerReady && !inFlight && video.videoWidth) sendFrame();
+  sendIfNewFrame();
   scheduleFrame();
 }
 
-function sendFrame() {
+// Without requestVideoFrameCallback (Firefox) the loop runs at the display rate, often faster than
+// the camera delivers frames. The frame counter tells whether the picture has changed; where it
+// isn't available (null), sendFrame compares the frame's content instead.
+function currentFrameId() {
+  const quality = video.getVideoPlaybackQuality?.();
+  return quality && quality.totalVideoFrames ? quality.totalVideoFrames : null;
+}
+
+// Drops frames while the detector is busy, so boxes never lag behind the picture, and never sends
+// the same frame twice (it would look like nothing moved).
+function sendIfNewFrame() {
+  if (running !== true || !workerReady || inFlight || !video.videoWidth) return;
+  const id = currentFrameId();
+  if (id !== null && id === lastSentFrame) return;
+  if (sendFrame(id === null)) lastSentFrame = id;
+}
+
+// Sum of a sample of the frame's bytes. Real camera frames always differ a little (sensor noise), so
+// an equal sum means the same picture again.
+function checksum(data) {
+  let sum = 0;
+  for (let i = 0; i < data.length; i += 7) sum = (sum + data[i] * (i + 1)) % 2147483647;
+  return sum;
+}
+
+// Returns false if `checkRepeat` is set and the frame is the same picture as the last one sent.
+function sendFrame(checkRepeat) {
   // `detail` is the long side, so portrait and landscape process the same number of pixels.
   const { videoWidth: vw, videoHeight: vh } = video;
   const w = vw >= vh ? settings.detail : Math.round((settings.detail * vw) / vh);
@@ -289,9 +320,15 @@ function sendFrame() {
     grabCtx.drawImage(video, 0, 0, w, h);
   }
   const { data } = grabCtx.getImageData(0, 0, w, h);
+  if (checkRepeat) {
+    const sum = checksum(data);
+    if (sum === lastChecksum) return false;
+    lastChecksum = sum;
+  }
   boxesFrame = { w, h };
   inFlight = true;
   worker.postMessage({ type: 'frame', buffer: data.buffer, width: w, height: h }, [data.buffer]);
+  return true;
 }
 
 function countFrame() {

@@ -3,7 +3,7 @@
 // Messages out: {type:'ready'} | {type:'error', message} | {type:'result', boxes, heat, mode, features, inliers, ms}
 'use strict';
 
-importScripts('vendor/opencv.js', 'detector.js');
+importScripts('vendor/opencv.js', 'imgproc.js', 'detector.js');
 
 let detector = null;
 let pendingOptions = {};

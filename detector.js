@@ -1,10 +1,10 @@
 /*
- * Motion detector that compensates for camera movement, built on OpenCV.js.
+ * Motion detector that compensates for camera movement.
  *
  * Per frame:
- *   1. Track corner features from the previous frame into the current one (Lucas-Kanade), then
- *      back again, keeping only points that return to where they started.
- *   2. Fit a homography to those matches with RANSAC. Background points dominate, so this
+ *   1. Track corner features from the previous frame into the current one (pyramidal Lucas-Kanade),
+ *      then back again, keeping only points that return to where they started.
+ *   2. Fit a homography to those matches with RANSAC (OpenCV). Background points dominate, so this
  *      is the camera's own motion; points on moving objects get rejected as outliers.
  *   3. Warp the previous two frames onto the current one, match their brightness (auto exposure),
  *      and compare each pixel with its 3x3 neighbourhood in each, which tolerates 1 px of
@@ -12,22 +12,27 @@
  *      some of its pixels also differ from the frame before last. The spot an object just left
  *      matches that frame, so no ghost is left behind, and a glitch in one frame is ignored.
  *   4. Threshold and clean up with morphology. Nearby blobs are grouped using a dilated copy of
- *      the mask, but each box is fitted to the undilated pixels so it hugs the object.
+ *      the mask, but each box is fitted to the confirmed pixels so it hugs the object.
  *   5. Feed the boxes to a tracker. A target is reported once it has been seen in minHits frames.
  *      When it stops moving it is kept as a "held" box for holdMs, carried along with the camera
  *      motion so it stays on the target while the phone moves.
  *
- * Optionally (opts.heatmap) it also keeps a motion heatmap: confirmed motion pixels of each accepted
- * blob are added as heat, which fades over heatFadeMs and is carried along with the camera motion so
- * it stays where the motion happened. It is returned at a quarter of the frame size.
+ * Optionally (opts.heatmap) it also keeps a motion heatmap: confirmed motion pixels of confirmed
+ * targets are added as heat, which fades over heatFadeMs and is carried along with the camera motion
+ * so it stays where the motion happened. It is returned at a quarter of the frame size.
+ *
+ * All pixel work is plain JavaScript (imgproc.js), which is fast in every browser; OpenCV.js is only
+ * used for the RANSAC homography fit, because its other operations are 10-20x slower in Firefox.
  *
  * Kernel sizes, feature spacing and RANSAC tolerance are tuned for a 320 px frame and scale with
  * the frame size. The noise filter stays 3x3 at every size so small, thin movers survive.
  *
- * Works in a Web Worker (global `createDetector`) and in Node (module.exports) for tests.
+ * Works in a Web Worker (globals `createDetector`, needs `imgproc`) and in Node (module.exports).
  */
 (function (root) {
   'use strict';
+
+  const ip = root.imgproc || (typeof require === 'function' ? require('./imgproc.js') : null);
 
   const DEFAULTS = {
     threshold: 30,        // gray-level difference (0-255) that counts as change
@@ -39,7 +44,7 @@
     matchDistance: 0.06,  // extra distance (fraction of frame size) a target may jump between frames
     maxCoastFrames: 2,    // frames a very fast target that went unseen is followed (hidden) along its path
     maxTracks: 30,
-    maxCorners: 300,      // at 320 px; scales with frame size up to 400
+    maxCorners: 200,      // feature points used to estimate camera motion (one per grid cell)
     minFeatures: 12,      // fewer tracked points than this: camera motion can't be trusted
     minSpreadCells: 5,    // camera-motion inliers must cover this many cells of a 4x4 grid
     maxRoundTrip: 1,      // px at 320 px: forward-backward tracking error allowed per point
@@ -70,57 +75,33 @@
     // { x, y, w, h, vx, vy, hits, lastSeen, held, coast: frames coasted, cx/cy: offset coasted, id }
     let tracks = [];
     let nextId = 1;
-    let rgba, gray, prevGray, prev2Gray, warped, warpedMin, warpedMax, above, motion, motion2, groups;
-    let valid, warpedValid;
-    let heat, heatTmp, heatSrc, heatSmallF, heatSmall, heatBlur; // heatmap state, allocated with the frame
+    // Frames and masks (Uint8Array unless noted), allocated per frame size.
+    let gray, prevGray, prev2Gray, warped, warpedMin, warpedMax, diff, motion, motion2, groups, warpedValid;
+    let u8tmp, f32tmp;
+    let labels; // Int32Array, connected-component labels of `groups`
+    let heat, heatTmp, heatSrc, heatSmall; // heat and heatTmp are Float32Array
+    let pyrPrev = null; // pyramid of prevGray
+    let pyrCur = null; // pyramid of gray
     let lastHeatTime = null;
-    let kernelOpen, kernelGrow;
     let scale = 1; // frame size relative to the 320 px the defaults are tuned for
-    let pyramidLevels;
-
-    const empty = new cv.Mat();
-    const identity = cv.Mat.eye(3, 3, cv.CV_64F);
-    const winSize = new cv.Size(21, 21);
-    const blurSize = new cv.Size(5, 5);
-    const criteria = new cv.TermCriteria(cv.TermCriteria_EPS | cv.TermCriteria_COUNT, 20, 0.03);
-
-    function freeFrames() {
-      const mats = [rgba, gray, prevGray, prev2Gray, warped, warpedMin, warpedMax, above, motion, motion2, groups,
-        valid, warpedValid, heat, heatTmp, heatSrc, heatSmallF, heatSmall];
-      for (const m of [...mats, kernelOpen, kernelGrow]) {
-        if (m) m.delete();
-      }
-    }
+    let pyramidLevels, growSize, heatBlurSize;
 
     function allocate(w, h) {
-      freeFrames();
       width = w;
       height = h;
+      const n = w * h;
       scale = Math.max(w, h) / 320;
       pyramidLevels = Math.round(3 + Math.log2(Math.max(1, scale)));
-      // Rectangular kernels: several times faster than elliptical ones in OpenCV.js, and the shape
-      // doesn't matter since boxes are fitted to the exact motion pixels afterwards.
-      kernelOpen = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
-      kernelGrow = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(odd(7 * scale), odd(7 * scale)));
-      rgba = new cv.Mat(h, w, cv.CV_8UC4);
-      gray = new cv.Mat(h, w, cv.CV_8UC1);
-      prevGray = new cv.Mat(h, w, cv.CV_8UC1);
-      prev2Gray = new cv.Mat(h, w, cv.CV_8UC1);
-      warped = new cv.Mat(h, w, cv.CV_8UC1);
-      motion = new cv.Mat(h, w, cv.CV_8UC1);
-      motion2 = new cv.Mat(h, w, cv.CV_8UC1);
-      heat = new cv.Mat(h, w, cv.CV_32FC1, new cv.Scalar(0));
-      heatTmp = new cv.Mat(h, w, cv.CV_32FC1);
-      heatSrc = new cv.Mat(h, w, cv.CV_8UC1);
-      heatSmallF = new cv.Mat();
-      heatSmall = new cv.Mat();
-      heatBlur = new cv.Size(odd(7 * scale), odd(7 * scale));
-      groups = new cv.Mat(h, w, cv.CV_8UC1);
-      valid = new cv.Mat(h, w, cv.CV_8UC1, new cv.Scalar(255));
-      warpedValid = new cv.Mat(h, w, cv.CV_8UC1);
-      warpedMin = new cv.Mat(h, w, cv.CV_8UC1);
-      warpedMax = new cv.Mat(h, w, cv.CV_8UC1);
-      above = new cv.Mat(h, w, cv.CV_8UC1);
+      growSize = odd(7 * scale);
+      heatBlurSize = odd(7 * scale);
+      [gray, prevGray, prev2Gray, warped, warpedMin, warpedMax, diff, motion, motion2, groups, warpedValid, u8tmp, heatSrc] =
+        Array.from({ length: 13 }, () => new Uint8Array(n));
+      f32tmp = new Float32Array(n);
+      labels = new Int32Array(n);
+      heat = new Float32Array(n);
+      heatTmp = new Float32Array(n);
+      heatSmall = null;
+      pyrPrev = pyrCur = null;
       reset();
     }
 
@@ -130,73 +111,62 @@
       lastMotion = null;
       tracks = [];
       lastHeatTime = null;
-      if (heat) heat.setTo(new cv.Scalar(0));
+      if (heat) heat.fill(0);
     }
 
-    // Returns { H, features, inliers } where H maps prevGray -> gray, or H = null if tracking failed.
-    // The caller must delete H unless it is the shared identity matrix.
+    // Returns { m, features, inliers }: m is the camera motion prev -> current as a row-major 3x3
+    // array (IDENTITY when it can't be told apart from a still camera), or null if tracking failed.
     function estimateCameraMotion() {
-      const corners = new cv.Mat();
-      const next = new cv.Mat();
-      const back = new cv.Mat();
-      const status = new cv.Mat();
-      const backStatus = new cv.Mat();
-      const err = new cv.Mat();
-      try {
-        const maxCorners = Math.min(400, Math.round(opts.maxCorners * scale));
-        const spacing = Math.max(5, Math.round(7 * scale));
-        cv.goodFeaturesToTrack(prevGray, corners, maxCorners, 0.01, spacing, empty, 7, false, 0.04);
-        // Too little texture to track (blank wall, darkness). Assume a still camera.
-        if (corners.rows < opts.minFeatures) return { H: identity, features: corners.rows, inliers: 0 };
+      const corners = ip.findCorners(pyrPrev, opts.maxCorners);
+      const count = corners.length / 2;
+      // Too little texture to track (blank wall, darkness). Assume a still camera.
+      if (count < opts.minFeatures) return { m: IDENTITY, features: count, inliers: 0 };
 
-        cv.calcOpticalFlowPyrLK(prevGray, gray, corners, next, status, err, winSize, pyramidLevels, criteria);
-        cv.calcOpticalFlowPyrLK(gray, prevGray, next, back, backStatus, err, winSize, pyramidLevels, criteria);
+      const next = new Float32Array(corners.length);
+      const back = new Float32Array(corners.length);
+      const status = new Uint8Array(count);
+      const backStatus = new Uint8Array(count);
+      ip.trackPoints(pyrPrev, pyrCur, corners, next, status);
+      ip.trackPoints(pyrCur, pyrPrev, next, back, backStatus);
 
-        const maxRoundTrip = opts.maxRoundTrip * scale;
-        const src = [];
-        const dst = [];
-        for (let i = 0; i < status.rows; i++) {
-          if (status.data[i] !== 1 || backStatus.data[i] !== 1) continue;
-          const dx = back.data32F[2 * i] - corners.data32F[2 * i];
-          const dy = back.data32F[2 * i + 1] - corners.data32F[2 * i + 1];
-          if (dx * dx + dy * dy > maxRoundTrip * maxRoundTrip) continue;
-          src.push(corners.data32F[2 * i], corners.data32F[2 * i + 1]);
-          dst.push(next.data32F[2 * i], next.data32F[2 * i + 1]);
-        }
-        const tracked = src.length / 2;
-        if (tracked < opts.minFeatures) return { H: null, features: tracked, inliers: 0 };
-
-        const srcMat = cv.matFromArray(tracked, 1, cv.CV_32FC2, src);
-        const dstMat = cv.matFromArray(tracked, 1, cv.CV_32FC2, dst);
-        const inlierMask = new cv.Mat();
-        const H = cv.findHomography(srcMat, dstMat, cv.RANSAC, 2 * scale, inlierMask, 2000, 0.995);
-        let inliers = 0;
-        let cells = 0;
-        if (!H.empty()) ({ inliers, cells } = inlierSpread(inlierMask, dst));
-        srcMat.delete();
-        dstMat.delete();
-        inlierMask.delete();
-
-        // If the agreeing points are few or bunched together, they are probably on one moving
-        // object over a plain background, and "compensating" would erase that object.
-        // Assume a still camera instead; the changed-area guard catches it if that's wrong.
-        if (H.empty() || inliers < opts.minFeatures || cells < opts.minSpreadCells) {
-          H.delete();
-          return { H: identity, features: tracked, inliers };
-        }
-        if (!plausible(H)) {
-          H.delete();
-          return { H: null, features: tracked, inliers };
-        }
-        return { H, features: tracked, inliers };
-      } finally {
-        corners.delete();
-        next.delete();
-        back.delete();
-        status.delete();
-        backStatus.delete();
-        err.delete();
+      const maxRoundTrip = opts.maxRoundTrip * scale;
+      const src = [];
+      const dst = [];
+      for (let i = 0; i < count; i++) {
+        if (status[i] !== 1 || backStatus[i] !== 1) continue;
+        const dx = back[2 * i] - corners[2 * i];
+        const dy = back[2 * i + 1] - corners[2 * i + 1];
+        if (dx * dx + dy * dy > maxRoundTrip * maxRoundTrip) continue;
+        src.push(corners[2 * i], corners[2 * i + 1]);
+        dst.push(next[2 * i], next[2 * i + 1]);
       }
+      const tracked = src.length / 2;
+      if (tracked < opts.minFeatures) return { m: null, features: tracked, inliers: 0 };
+
+      const srcMat = cv.matFromArray(tracked, 1, cv.CV_32FC2, src);
+      const dstMat = cv.matFromArray(tracked, 1, cv.CV_32FC2, dst);
+      const inlierMask = new cv.Mat();
+      const H = cv.findHomography(srcMat, dstMat, cv.RANSAC, 2 * scale, inlierMask, 2000, 0.995);
+      let inliers = 0;
+      let cells = 0;
+      let m = null;
+      if (!H.empty()) {
+        ({ inliers, cells } = inlierSpread(inlierMask, dst));
+        m = Array.from(H.data64F);
+      }
+      srcMat.delete();
+      dstMat.delete();
+      inlierMask.delete();
+      H.delete();
+
+      // If the agreeing points are few or bunched together, they are probably on one moving
+      // object over a plain background, and "compensating" would erase that object.
+      // Assume a still camera instead; the changed-area guard catches it if that's wrong.
+      if (!m || inliers < opts.minFeatures || cells < opts.minSpreadCells) {
+        return { m: IDENTITY, features: tracked, inliers };
+      }
+      if (!plausible(m)) return { m: null, features: tracked, inliers };
+      return { m, features: tracked, inliers };
     }
 
     // Counts RANSAC inliers and how many cells of a 4x4 grid over the frame they land in.
@@ -214,8 +184,7 @@
     }
 
     // Reject homographies that would fling the frame corners further than a phone can move in one frame.
-    function plausible(H) {
-      const m = H.data64F;
+    function plausible(m) {
       const limit = 0.35 * Math.max(width, height);
       for (const [x, y] of [[0, 0], [width, 0], [0, height], [width, height]]) {
         const d = m[6] * x + m[7] * y + m[8];
@@ -227,46 +196,86 @@
       return true;
     }
 
-    // Groups come from the dilated mask; each box is then shrunk to the motion pixels inside it.
-    // With `confirm`, groups without pixels that also changed since the frame before last are dropped.
+    /**
+     * Connected groups (8-connected) of the dilated mask become candidate boxes. Each box is fitted to
+     * the motion pixels of its group; with `confirm`, only confirmed (two-step) pixels count, so a
+     * ghost that the grouping step joined onto its object doesn't stretch the box, and groups without
+     * confirmed pixels are dropped.
+     */
     function findBoxes(confirm) {
-      const contours = new cv.MatVector();
-      const hierarchy = new cv.Mat();
-      cv.findContours(groups, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      const n = labelGroups();
+      const minX = new Int32Array(n + 1).fill(width);
+      const minY = new Int32Array(n + 1).fill(height);
+      const maxX = new Int32Array(n + 1).fill(-1);
+      const maxY = new Int32Array(n + 1).fill(-1);
+      const count = new Int32Array(n + 1);
+      const px = confirm ? motion2 : motion;
+      for (let y = 0, i = 0; y < height; y++) {
+        for (let x = 0; x < width; x++, i++) {
+          const l = labels[i];
+          if (!l || !px[i]) continue;
+          count[l]++;
+          if (x < minX[l]) minX[l] = x;
+          if (x > maxX[l]) maxX[l] = x;
+          if (y < minY[l]) minY[l] = y;
+          if (y > maxY[l]) maxY[l] = y;
+        }
+      }
       const minPx = opts.minArea * width * height;
       const boxes = [];
-      for (let i = 0; i < contours.size(); i++) {
-        const c = contours.get(i);
-        const g = cv.boundingRect(c);
-        c.delete();
-        const r = motionBounds(g, confirm);
-        if (r && r.w * r.h >= minPx && (!confirm || r.confirmed >= 2)) boxes.push(r);
+      for (let l = 1; l <= n; l++) {
+        if (maxX[l] < 0) continue;
+        const r = { x: minX[l], y: minY[l], w: maxX[l] - minX[l] + 1, h: maxY[l] - minY[l] + 1, confirmed: count[l] };
+        if (r.w * r.h >= minPx && (!confirm || r.confirmed >= 2)) boxes.push(r);
       }
-      contours.delete();
-      hierarchy.delete();
       return mergeBoxes(boxes, 0);
     }
 
-    // Bounding box of the motion pixels inside rect g, or null if there are none.
-    // (This OpenCV.js build has no findNonZero.)
-    // With `confirm`, only confirmed (two-step) pixels count, so a ghost that the grouping step
-    // joined onto its object doesn't stretch the box; `confirmed` is how many there were.
-    function motionBounds(g, confirm) {
-      const px = confirm ? motion2.data : motion.data;
-      let minX = Infinity, minY = Infinity, maxX = -1, maxY = -1;
-      let confirmed = 0;
-      for (let y = g.y; y < g.y + g.height; y++) {
-        const row = y * width;
-        for (let x = g.x; x < g.x + g.width; x++) {
-          if (!px[row + x]) continue;
-          confirmed++;
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          maxY = y;
+    // Two-pass connected-component labelling of `groups` into `labels`; returns the label count.
+    function labelGroups() {
+      const parent = [0];
+      const find = (a) => {
+        while (parent[a] !== a) a = parent[a] = parent[parent[a]];
+        return a;
+      };
+      const union = (a, b) => {
+        a = find(a);
+        b = find(b);
+        if (a !== b) parent[Math.max(a, b)] = Math.min(a, b);
+      };
+      const w = width;
+      for (let y = 0, i = 0; y < height; y++) {
+        for (let x = 0; x < w; x++, i++) {
+          if (!groups[i]) {
+            labels[i] = 0;
+            continue;
+          }
+          const left = x > 0 ? labels[i - 1] : 0;
+          const upLeft = x > 0 && y > 0 ? labels[i - w - 1] : 0;
+          const up = y > 0 ? labels[i - w] : 0;
+          const upRight = x < w - 1 && y > 0 ? labels[i - w + 1] : 0;
+          let l = left || upLeft || up || upRight;
+          if (!l) {
+            l = parent.length;
+            parent.push(l);
+          } else {
+            if (left) union(l, left);
+            if (upLeft) union(l, upLeft);
+            if (up) union(l, up);
+            if (upRight) union(l, upRight);
+          }
+          labels[i] = l;
         }
       }
-      return maxX < 0 ? null : { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1, confirmed };
+      const compact = new Int32Array(parent.length);
+      let n = 0;
+      for (let l = 1; l < parent.length; l++) {
+        const r = find(l);
+        if (!compact[r]) compact[r] = ++n;
+        compact[l] = compact[r];
+      }
+      for (let i = 0; i < labels.length; i++) if (labels[i]) labels[i] = compact[labels[i]];
+      return n;
     }
 
     // ---------- Target tracking ----------
@@ -428,54 +437,55 @@
     }
 
     /**
-     * Process one RGBA frame captured at time `now` (ms). Returns { boxes, mode, features, inliers }.
+     * Process one RGBA frame captured at time `now` (ms). Returns { boxes, heat, mode, features, inliers }.
      * Boxes are in frame pixels; `held` marks targets that have stopped moving.
      * mode: 'init' (first frame), 'ok', 'lost' (camera moved too fast to track), 'noisy' (too much changed).
      */
     function processFrame(data, w, h, now = Date.now()) {
       if (w !== width || h !== height) allocate(w, h);
-      rgba.data.set(data);
-      cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY);
-      cv.GaussianBlur(gray, gray, blurSize, 0); // 5x5 at any size; larger kernels are far slower here
+      ip.rgbaToGray(data, gray);
+      ip.gaussian5(gray, gray, width, height, f32tmp);
+      pyrCur = ip.buildPyramid(gray, width, height, pyramidLevels, pyrSpare);
 
       if (!started) {
         started = true;
         advance(null);
-        return { boxes: [], mode: 'init', features: 0, inliers: 0 };
+        return { boxes: [], heat: null, mode: 'init', features: 0, inliers: 0 };
       }
 
-      const { H, features, inliers } = estimateCameraMotion();
+      const { m: m1, features, inliers } = estimateCameraMotion();
       expireTracks(now);
-      if (!H) {
+      if (!m1) {
         // Can't tell where the camera went; leave held boxes where they are until it settles.
         advance(null);
         return { boxes: reportTracks(now), heat: updateHeat(null, null, false, now), mode: 'lost', features, inliers };
       }
-      const m1 = H === identity ? IDENTITY : H.data64F.slice();
-      if (H !== identity) H.delete();
       if (m1 !== IDENTITY) moveTracks(m1);
 
+      const n = width * height;
+      const thr = opts.threshold;
       // What changed since the previous frame gives each blob's full extent...
-      changedSince(prevGray, m1, warpedValid, motion);
-      cv.threshold(motion, motion, opts.threshold, 255, cv.THRESH_BINARY);
-      cv.bitwise_and(motion, warpedValid, motion);
-      cv.morphologyEx(motion, motion, cv.MORPH_OPEN, kernelOpen);
-      cv.dilate(motion, groups, kernelGrow, new cv.Point(-1, -1), 2);
+      changedSince(prevGray, m1, warpedValid, diff);
+      for (let i = 0; i < n; i++) motion[i] = diff[i] > thr && warpedValid[i] ? 255 : 0;
+      ip.erode(motion, motion, width, height, 3, u8tmp); // opening: drop specks smaller than 3x3
+      ip.dilate(motion, motion, width, height, 3, u8tmp);
+      ip.dilate(motion, groups, width, height, 2 * growSize - 1, u8tmp);
       // ...and pixels that also changed since the frame before (camera motion composed over both
       // steps) confirm it. A spot an object has just left, or a glitch in the previous frame, matches
       // the frame before last, so its blob has no confirmed pixels and is dropped.
       const twoStep = frameCount >= 1 && lastMotion !== null;
       if (twoStep) {
         // Its result is only used where the first comparison found motion, so it reuses that one's
-        // valid-pixel mask instead of warping its own.
-        changedSince(prev2Gray, multiply(m1, lastMotion), null, motion2);
-        cv.threshold(motion2, motion2, opts.threshold, 255, cv.THRESH_BINARY);
-        cv.bitwise_and(motion2, motion, motion2);
+        // valid-pixel mask instead of computing its own.
+        changedSince(prev2Gray, multiply(m1, lastMotion), null, diff);
+        for (let i = 0; i < n; i++) motion2[i] = diff[i] > thr && motion[i] ? 255 : 0;
       }
 
       advance(m1);
 
-      if (cv.countNonZero(groups) > opts.maxChangedArea * width * height) {
+      let changed = 0;
+      for (let i = 0; i < n; i++) if (groups[i]) changed++;
+      if (changed > opts.maxChangedArea * n) {
         return { boxes: reportTracks(now), heat: updateHeat(m1, null, false, now), mode: 'noisy', features, inliers };
       }
       updateTracks(findBoxes(twoStep), now);
@@ -488,66 +498,65 @@
 
     /**
      * Fades the heatmap, moves it with camera motion `m` (if known), and adds the motion pixels inside
-     * `targets` (boxes of confirmed targets seen this frame; two-step pixels when `twoStep`). Returns it at a quarter of
-     * the frame size as { w, h, data: Uint8Array }, or null if the heatmap is off.
+     * `targets` (boxes of confirmed targets seen this frame; two-step pixels when `twoStep`). Returns it
+     * at a quarter of the frame size as { w, h, data: Uint8Array }, or null if the heatmap is off.
      */
     function updateHeat(m, targets, twoStep, now) {
       if (!opts.heatmap) return null;
       const dt = lastHeatTime === null ? 0 : now - lastHeatTime;
       lastHeatTime = now;
-      const size = new cv.Size(width, height);
+      const n = width * height;
 
       if (m && m !== IDENTITY) {
-        const M = cv.matFromArray(3, 3, cv.CV_64F, m);
-        cv.warpPerspective(heat, heatTmp, M, size, cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar(0));
-        M.delete();
-        heatTmp.copyTo(heat);
+        ip.warpPerspective(heat, heatTmp, width, height, m, null);
+        [heat, heatTmp] = [heatTmp, heat];
       }
       const decay = opts.heatFadeMs > 0 ? Math.pow(0.5, dt / (opts.heatFadeMs / 4)) : 0;
-      heat.convertTo(heat, -1, decay, 0);
+      for (let i = 0; i < n; i++) heat[i] *= decay;
 
       if (targets && targets.length) {
         const source = twoStep ? motion2 : motion;
-        heatSrc.setTo(new cv.Scalar(0));
+        heatSrc.fill(0);
         for (const t of targets) {
-          const x = Math.max(0, Math.round(t.x));
-          const y = Math.max(0, Math.round(t.y));
-          const w = Math.min(width, Math.round(t.x + t.w)) - x;
-          const h = Math.min(height, Math.round(t.y + t.h)) - y;
-          if (w <= 0 || h <= 0) continue;
-          const r = new cv.Rect(x, y, w, h);
-          const from = source.roi(r);
-          const to = heatSrc.roi(r);
-          from.copyTo(to);
-          from.delete();
-          to.delete();
+          const x0 = Math.max(0, Math.round(t.x));
+          const y0 = Math.max(0, Math.round(t.y));
+          const x1 = Math.min(width, Math.round(t.x + t.w));
+          const y1 = Math.min(height, Math.round(t.y + t.h));
+          for (let y = y0; y < y1; y++) {
+            for (let x = x0, i = y * width + x0; x < x1; x++, i++) heatSrc[i] = source[i];
+          }
         }
         // Fill in sparse edge pixels and soften the blob into a glow.
-        cv.dilate(heatSrc, heatSrc, kernelGrow);
-        cv.blur(heatSrc, heatSrc, heatBlur);
-        heatSrc.convertTo(heatTmp, cv.CV_32F, 1, 0);
-        cv.max(heat, heatTmp, heat);
+        ip.dilate(heatSrc, heatSrc, width, height, growSize, u8tmp);
+        ip.boxBlur(heatSrc, heatSrc, width, height, heatBlurSize, f32tmp);
+        for (let i = 0; i < n; i++) if (heatSrc[i] > heat[i]) heat[i] = heatSrc[i];
       }
 
-      const sw = Math.max(1, Math.round(width / 4));
-      const sh = Math.max(1, Math.round(height / 4));
-      cv.resize(heat, heatSmallF, new cv.Size(sw, sh), 0, 0, cv.INTER_AREA);
-      heatSmallF.convertTo(heatSmall, cv.CV_8U, 1, 0);
-      return { w: sw, h: sh, data: new Uint8Array(heatSmall.data) };
+      // A fresh array every time: it is handed (transferred) to the page.
+      const sw = Math.ceil(width / 4);
+      const sh = Math.ceil(height / 4);
+      const small = new Uint8Array(sw * sh);
+      ip.shrink(heat, width, height, 4, small, sw, sh);
+      return { w: sw, h: sh, data: small };
     }
 
     // Shifts the frame history: current -> prev -> prev2. `m` is the camera motion prev -> current,
     // or null if it is unknown (first frame, lost tracking), which restarts the history.
+    let pyrSpare = null;
     function advance(m) {
       if (m) {
-        prevGray.copyTo(prev2Gray);
+        prev2Gray.set(prevGray);
         lastMotion = m;
         frameCount++;
       } else {
         lastMotion = null;
         frameCount = 0;
       }
-      gray.copyTo(prevGray);
+      prevGray.set(gray);
+      // The current pyramid becomes the previous one; the old previous one is reused next frame.
+      pyrSpare = pyrPrev;
+      pyrPrev = pyrCur;
+      pyrCur = null;
     }
 
     /**
@@ -560,33 +569,36 @@
      * size so small, slow movers still register.
      */
     function changedSince(ref, m, validOut, out) {
-      const size = new cv.Size(width, height);
-      const black = new cv.Scalar(0);
-      const M = cv.matFromArray(3, 3, cv.CV_64F, m);
-      cv.warpPerspective(ref, warped, M, size, cv.INTER_LINEAR, cv.BORDER_CONSTANT, black);
-      if (validOut) {
-        // Pixels warped in from outside the reference frame have no valid comparison.
-        cv.warpPerspective(valid, validOut, M, size, cv.INTER_NEAREST, cv.BORDER_CONSTANT, black);
-        cv.erode(validOut, validOut, kernelGrow);
+      ip.warpPerspective(ref, warped, width, height, m, validOut);
+      // Pixels near where the reference frame ran out are unreliable too.
+      if (validOut) ip.erode(validOut, validOut, width, height, growSize, u8tmp);
+      const gain = brightnessGain(validOut || warpedValid);
+      ip.erode(warped, warpedMin, width, height, 3, u8tmp);
+      ip.dilate(warped, warpedMax, width, height, 3, u8tmp);
+      for (let i = 0; i < out.length; i++) {
+        const g = gray[i];
+        const lo = warpedMin[i] * gain;
+        const hi = warpedMax[i] * gain;
+        const d = g > hi ? g - hi : lo > g ? lo - g : 0;
+        out[i] = d > 255 ? 255 : d;
       }
-      M.delete();
-
-      matchBrightness(validOut || warpedValid);
-      cv.erode(warped, warpedMin, kernelOpen);
-      cv.dilate(warped, warpedMax, kernelOpen);
-      cv.subtract(gray, warpedMax, above); // saturates at 0: only where brighter than any neighbour
-      cv.subtract(warpedMin, gray, out); // only where darker than any neighbour
-      cv.add(out, above, out);
     }
 
     // Phones adjust exposure as the scene changes, brightening or darkening the whole frame.
-    // Scale the warped reference frame so its average brightness matches the current one.
-    function matchBrightness(mask) {
-      const before = cv.mean(warped, mask)[0];
-      const now = cv.mean(gray, mask)[0];
-      if (before < 1) return;
-      const gain = now / before;
-      if (Math.abs(gain - 1) > 0.01) warped.convertTo(warped, -1, gain, 0);
+    // Returns the factor that matches the warped reference frame's average brightness to the current one.
+    function brightnessGain(mask) {
+      let before = 0;
+      let current = 0;
+      let count = 0;
+      for (let i = 0; i < mask.length; i++) {
+        if (!mask[i]) continue;
+        before += warped[i];
+        current += gray[i];
+        count++;
+      }
+      if (!count || before < count) return 1;
+      const gain = current / before;
+      return Math.abs(gain - 1) > 0.01 ? gain : 1;
     }
 
     function configure(next) {
@@ -594,8 +606,7 @@
     }
 
     function dispose() {
-      freeFrames();
-      for (const m of [empty, identity]) m.delete();
+      // Everything is plain typed arrays now; nothing to free.
     }
 
     return { processFrame, configure, reset, dispose, options: opts };
