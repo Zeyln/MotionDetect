@@ -2,16 +2,19 @@
  * Extract mode: "time difference" effects that compare the live picture with itself a moment ago.
  *
  * Everything is canvas blending, done by the graphics chip; no detector or OpenCV is involved. The
- * last frames are kept in a ring of canvases at 720 px, each effect is composed on one working
- * canvas of that size, and the result is scaled once onto the screen.
+ * last frames are kept, with their capture times, in a ring of canvases at 640 px; each effect is
+ * composed on one working canvas of that size, and the result is scaled once onto the screen.
+ * Delays are in milliseconds: the effect uses the newest stored frame at least that old, so the
+ * shortest possible delay is one camera frame.
  *
  * Exposes `createExtractor()` (global, for the page).
  */
 (function (root) {
   'use strict';
 
-  const MAX_DELAY = 30; // frames of history kept (about 1 s at 30 fps)
-  const LONG_SIDE = 720;
+  const MAX_FRAMES = 64; // history kept: just over 1 s at 60 fps (about 60 MB at 640 px)
+  const MAX_DELAY_MS = 1000;
+  const LONG_SIDE = 640;
 
   /**
    * The effects, in the order they appear. `strength` names what the second slider does for that
@@ -77,16 +80,17 @@
       thermalImage = small.g.createImageData(sw, sh);
     }
 
-    // Stores the video's current frame as the newest in the history.
-    function push(video) {
+    // Stores the video's current frame, captured at `time` (ms), as the newest in the history.
+    function push(video, time) {
       const { videoWidth: vw, videoHeight: vh } = video;
       if (!vw) return;
       const s = LONG_SIDE / Math.max(vw, vh);
       if (Math.round(vw * s) !== w || Math.round(vh * s) !== h) resize(vw, vh);
-      head = (head + 1) % (MAX_DELAY + 1);
+      head = (head + 1) % MAX_FRAMES;
       if (!ring[head]) ring[head] = canvas(w, h);
       ring[head].g.drawImage(video, 0, 0, w, h);
-      filled = Math.min(filled + 1, MAX_DELAY + 1);
+      ring[head].t = time;
+      filled = Math.min(filled + 1, MAX_FRAMES);
     }
 
     function reset() {
@@ -95,10 +99,27 @@
       if (trail) trail.g.clearRect(0, 0, w, h);
     }
 
-    // The frame `k` frames ago (or the oldest one kept, early on).
-    function past(k) {
-      const back = Math.min(k, filled - 1);
-      return ring[(head - back + (MAX_DELAY + 1) * 2) % (MAX_DELAY + 1)].c;
+    const entry = (back) => ring[(head - back + MAX_FRAMES) % MAX_FRAMES];
+    let used = 0; // how old the frame picked for the main comparison really was, in ms
+
+    // The newest frame at least `ms` older than the newest one (or the oldest kept, early on). With
+    // ms 0 it is the newest frame itself.
+    function past(ms) {
+      const newest = entry(0).t;
+      for (let back = 1; back < filled; back++) {
+        const e = entry(back);
+        if (newest - e.t >= ms) return e.c;
+      }
+      return entry(filled - 1).c;
+    }
+
+    function age(ms) {
+      const newest = entry(0).t;
+      for (let back = 1; back < filled; back++) {
+        const d = newest - entry(back).t;
+        if (d >= ms) return d;
+      }
+      return filled > 1 ? newest - entry(filled - 1).t : 0;
     }
 
     function blend(g, mode, alpha = 1) {
@@ -163,7 +184,7 @@
         blend(g, 'copy');
         g.fillStyle = '#000';
         g.fillRect(0, 0, w, h);
-        for (const [k, color] of [[0, '#f00'], [delay, '#0f0'], [Math.min(MAX_DELAY, 2 * delay), '#00f']]) {
+        for (const [k, color] of [[0, '#f00'], [delay, '#0f0'], [2 * delay, '#00f']]) {
           blend(work.g, 'copy');
           work.g.drawImage(past(k), 0, 0);
           blend(work.g, 'multiply');
@@ -210,7 +231,7 @@
         blend(work.g, 'copy');
         work.g.drawImage(past(0), 0, 0);
         blend(work.g, 'difference');
-        work.g.drawImage(past(Math.min(delay, 3)), 0, 0);
+        work.g.drawImage(past(Math.min(delay, 100)), 0, 0);
         blend(t, 'lighter');
         t.drawImage(work.c, 0, 0);
         t.drawImage(work.c, 0, 0); // twice: brighter trails
@@ -231,18 +252,21 @@
         g.drawImage(past(0), 0, 0);
         for (let i = strength; i >= 1; i--) {
           blend(g, 'source-over', 0.55 / i);
-          g.drawImage(past(Math.min(MAX_DELAY, i * delay)), 0, 0);
+          g.drawImage(past(i * delay), 0, 0);
         }
       },
     };
 
     /**
      * Draws effect `id` over the whole of `ctx` (W x H), cropped to fill it like the live video.
-     * `delay` is in frames (1..30); `strength` is 1..5.
+     * `delay` is in ms (up to 1000); `strength` is 1..5. Returns how old the compared frame really
+     * was (ms; at least one camera frame), or false if there is nothing to show yet.
      */
     function render(ctx, W, H, id, delay, strength) {
       if (!filled) return false;
-      (draw[id] || draw.overlay)(Math.max(1, delay), Math.max(1, Math.min(5, strength)));
+      delay = Math.max(1, Math.min(MAX_DELAY_MS, delay));
+      used = age(delay);
+      (draw[id] || draw.overlay)(delay, Math.max(1, Math.min(5, strength)));
       blend(comp.g, 'source-over');
       const fit = Math.max(W / w, H / h);
       const dw = w * fit;
@@ -251,7 +275,7 @@
       ctx.globalAlpha = 1;
       ctx.imageSmoothingEnabled = true;
       ctx.drawImage(comp.c, (W - dw) / 2, (H - dh) / 2, dw, dh);
-      return true;
+      return used;
     }
 
     return { push, render, reset };
@@ -259,5 +283,5 @@
 
   root.createExtractor = createExtractor;
   root.EXTRACT_EFFECTS = EFFECTS;
-  root.EXTRACT_MAX_DELAY = MAX_DELAY;
+  root.EXTRACT_MAX_DELAY_MS = MAX_DELAY_MS;
 })(typeof self !== 'undefined' ? self : globalThis);

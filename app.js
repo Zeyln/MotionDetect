@@ -57,7 +57,7 @@ const settings = Object.assign(
     detail: 800,
     syncVideo: true,
     effect: 'overlay',
-    delay: 6, // frames
+    delayMs: 100, // Extract: how far back the compared frame is
     strengths: {}, // per effect, 1..5
     showStats: false,
     facing: 'environment',
@@ -78,7 +78,6 @@ let lastMode = 'init';
 let lastFrameTime = null; // capture time of the last camera frame used, to skip repeats
 const stats = { frames: 0, since: performance.now(), fps: 0, ms: 0, inliers: 0 };
 const extractor = createExtractor();
-const camera = { frames: 0, since: performance.now(), fps: 30 }; // camera frame rate, for the Delay label
 
 // ---------- Settings ----------
 
@@ -138,8 +137,8 @@ function applySettings() {
   const effect = effectInfo(settings.effect);
   setChoice($('effects'), effect.id);
   $('effect-about').textContent = effect.about;
-  $('delay').value = settings.delay;
-  $('delay-out').textContent = Math.round((settings.delay * 1000) / camera.fps) + ' ms';
+  $('delay').value = settings.delayMs;
+  $('delay-out').textContent = settings.delayMs + ' ms';
   $('strength-row').hidden = !effect.strength;
   $('strength-label').textContent = effect.strength || '';
   $('strength').value = strengthOf(effect.id);
@@ -199,7 +198,7 @@ const sliders = {
   sensitivity: (v) => (settings.sensitivity = v),
   'min-size': (v) => (settings.minSize = v),
   'heat-fade': (v) => (settings.heatFade = v),
-  delay: (v) => (settings.delay = v),
+  delay: (v) => (settings.delayMs = v),
   strength: (v) => (settings.strengths[settings.effect] = v),
 };
 for (const [id, set] of Object.entries(sliders)) {
@@ -306,7 +305,8 @@ async function startCamera() {
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
-      video: { facingMode: settings.facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+      // 60 fps where the camera can (good light), so Extract's shortest delay is ~17 ms.
+      video: { facingMode: settings.facing, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 } },
     });
   } catch (e) {
     showStartError(
@@ -402,9 +402,10 @@ function onFrame(now, meta) {
     return;
   }
   lastFrameTime = t ?? null;
-  countCameraFrame();
   if (settings.mode === 'extract') {
-    extractor.push(video);
+    // Capture time in ms: captureTime is, mediaTime is in seconds.
+    const ms = meta?.captureTime ?? (meta?.mediaTime !== undefined ? meta.mediaTime * 1000 : performance.now());
+    extractor.push(video, ms);
     countFrame();
     drawExtract();
   } else if (workerReady && !inFlight && video.videoWidth) {
@@ -452,18 +453,6 @@ function countFrame() {
   }
 }
 
-// The camera's own frame rate, so the Delay slider can say how long its frames are.
-function countCameraFrame() {
-  camera.frames++;
-  const now = performance.now();
-  if (now - camera.since >= 2000) {
-    camera.fps = Math.max(1, (camera.frames * 1000) / (now - camera.since));
-    camera.frames = 0;
-    camera.since = now;
-    if (settings.mode === 'extract') $('delay-out').textContent = Math.round((settings.delay * 1000) / camera.fps) + ' ms';
-  }
-}
-
 // ---------- Drawing ----------
 
 function resizeOverlay() {
@@ -481,8 +470,14 @@ function updateHud(extra) {
 function drawExtract() {
   const W = overlay.width;
   const H = overlay.height;
-  if (!extractor.render(overlayCtx, W, H, settings.effect, settings.delay, strengthOf(settings.effect))) {
+  const used = extractor.render(overlayCtx, W, H, settings.effect, settings.delayMs, strengthOf(settings.effect));
+  if (used === false) {
     overlayCtx.clearRect(0, 0, W, H);
+  } else if (used) {
+    // Show the delay actually achieved: never less than one camera frame, whatever the slider says.
+    const text = Math.round(Math.max(used, 1)) + ' ms';
+    const out = $('delay-out');
+    if (out.textContent !== text) out.textContent = text;
   }
   updateHud('');
 }
