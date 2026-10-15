@@ -7,13 +7,16 @@
  *   2. Fit a homography to those matches with RANSAC. Background points dominate, so this
  *      is the camera's own motion; points on moving objects get rejected as outliers.
  *   3. Warp the previous frame onto the current one, match its brightness (auto exposure), and
- *      take the absolute difference. Whatever still differs moved independently of the camera.
+ *      compare each pixel with its 3x3 neighbourhood there, which tolerates 1 px of misalignment.
+ *      Whatever still differs moved independently of the camera.
  *   4. Threshold and clean up with morphology. Nearby blobs are grouped using a dilated copy of
  *      the mask, but each box is fitted to the undilated pixels so it hugs the object.
- *   5. Only report boxes that were also seen in the previous frame(s), to suppress flicker.
+ *   5. Feed the boxes to a tracker. A target is reported once it has been seen in minHits frames.
+ *      When it stops moving it is kept as a "held" box for holdMs, carried along with the camera
+ *      motion so it stays on the target while the phone moves.
  *
- * Pixel sizes (kernels, feature spacing, RANSAC tolerance) are tuned for a 320 px frame and
- * scale with the frame size, so behaviour stays the same at any processing resolution.
+ * Kernel sizes, feature spacing and RANSAC tolerance are tuned for a 320 px frame and scale with
+ * the frame size. The noise filter stays 3x3 at every size so small, thin movers survive.
  *
  * Works in a Web Worker (global `createDetector`) and in Node (module.exports) for tests.
  */
@@ -22,9 +25,12 @@
 
   const DEFAULTS = {
     threshold: 30,        // gray-level difference (0-255) that counts as change
-    minArea: 0.002,       // smallest blob to report, as a fraction of the frame area
+    minArea: 0.0001,      // smallest motion box to report, as a fraction of the frame area
     maxChangedArea: 0.4,  // if more than this fraction changed, motion estimate is bad: report nothing
-    minHits: 2,           // consecutive frames a box must appear in before it is reported
+    minHits: 2,           // frames a target must be seen in before it is reported
+    holdMs: 3000,         // how long a target stays boxed after it stops moving
+    matchDistance: 0.06,  // extra distance (fraction of frame size) a target may jump between frames
+    maxTracks: 30,
     maxCorners: 300,      // at 320 px; scales with frame size up to 400
     minFeatures: 12,      // fewer tracked points than this: camera motion can't be trusted
     minSpreadCells: 5,    // camera-motion inliers must cover this many cells of a 4x4 grid
@@ -39,8 +45,10 @@
     let width = 0;
     let height = 0;
     let hasPrev = false;
-    let prevBoxes = [];
-    let rgba, gray, prevGray, warped, motion, groups, valid, warpedValid, kernelOpen, kernelGrow;
+    let tracks = []; // { x, y, w, h, vx, vy, hits, lastSeen, held, id }
+    let nextId = 1;
+    let rgba, gray, prevGray, warped, warpedMin, warpedMax, above, motion, groups, valid, warpedValid;
+    let kernelOpen, kernelGrow;
     let scale = 1; // frame size relative to the 320 px the defaults are tuned for
     let pyramidLevels;
 
@@ -51,7 +59,8 @@
     const criteria = new cv.TermCriteria(cv.TermCriteria_EPS | cv.TermCriteria_COUNT, 20, 0.03);
 
     function freeFrames() {
-      for (const m of [rgba, gray, prevGray, warped, motion, groups, valid, warpedValid, kernelOpen, kernelGrow]) {
+      const mats = [rgba, gray, prevGray, warped, warpedMin, warpedMax, above, motion, groups, valid, warpedValid];
+      for (const m of [...mats, kernelOpen, kernelGrow]) {
         if (m) m.delete();
       }
     }
@@ -64,7 +73,7 @@
       pyramidLevels = Math.round(3 + Math.log2(Math.max(1, scale)));
       // Rectangular kernels: several times faster than elliptical ones in OpenCV.js, and the shape
       // doesn't matter since boxes are fitted to the exact motion pixels afterwards.
-      kernelOpen = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(odd(3 * scale), odd(3 * scale)));
+      kernelOpen = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
       kernelGrow = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(odd(7 * scale), odd(7 * scale)));
       rgba = new cv.Mat(h, w, cv.CV_8UC4);
       gray = new cv.Mat(h, w, cv.CV_8UC1);
@@ -74,12 +83,15 @@
       groups = new cv.Mat(h, w, cv.CV_8UC1);
       valid = new cv.Mat(h, w, cv.CV_8UC1, new cv.Scalar(255));
       warpedValid = new cv.Mat(h, w, cv.CV_8UC1);
+      warpedMin = new cv.Mat(h, w, cv.CV_8UC1);
+      warpedMax = new cv.Mat(h, w, cv.CV_8UC1);
+      above = new cv.Mat(h, w, cv.CV_8UC1);
       reset();
     }
 
     function reset() {
       hasPrev = false;
-      prevBoxes = [];
+      tracks = [];
     }
 
     // Returns { H, features, inliers } where H maps prevGray -> gray, or H = null if tracking failed.
@@ -213,22 +225,136 @@
       return maxX < 0 ? null : { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
     }
 
-    // Each box inherits the hit count of the previous boxes it overlaps, plus one.
-    function confirm(boxes) {
-      for (const b of boxes) {
-        let hits = 0;
-        for (const p of prevBoxes) if (overlaps(b, p, 0)) hits = Math.max(hits, p.hits);
-        b.hits = hits + 1;
+    // ---------- Target tracking ----------
+
+    // Moves every track by the camera motion m (row-major 3x3 homography) so boxes stay on their
+    // targets while the phone moves. Tracks that leave the frame are dropped.
+    function moveTracks(m) {
+      for (const t of tracks) {
+        const xs = [];
+        const ys = [];
+        for (const [x, y] of [[t.x, t.y], [t.x + t.w, t.y], [t.x, t.y + t.h], [t.x + t.w, t.y + t.h]]) {
+          const d = m[6] * x + m[7] * y + m[8];
+          xs.push((m[0] * x + m[1] * y + m[2]) / d);
+          ys.push((m[3] * x + m[4] * y + m[5]) / d);
+        }
+        t.x = Math.min(...xs);
+        t.y = Math.min(...ys);
+        t.w = Math.max(...xs) - t.x;
+        t.h = Math.max(...ys) - t.y;
       }
-      prevBoxes = boxes;
-      return boxes.filter((b) => b.hits >= opts.minHits);
+      tracks = tracks.filter((t) => t.x + t.w > 0 && t.y + t.h > 0 && t.x < width && t.y < height);
+    }
+
+    // Matches this frame's boxes to existing targets by predicted position, nearest pairs first.
+    function updateTracks(detections, now) {
+      const reach = opts.matchDistance * Math.max(width, height);
+      detections = absorbIntoHeld(detections);
+      const pairs = [];
+      tracks.forEach((t, ti) => {
+        const px = t.x + t.w / 2 + t.vx;
+        const py = t.y + t.h / 2 + t.vy;
+        detections.forEach((d, di) => {
+          const dist = Math.hypot(d.x + d.w / 2 - px, d.y + d.h / 2 - py);
+          const gate = (Math.hypot(t.w, t.h) + Math.hypot(d.w, d.h)) / 2 + reach;
+          if (dist < gate) pairs.push({ ti, di, dist });
+        });
+      });
+      pairs.sort((a, b) => a.dist - b.dist);
+
+      const matchedTracks = new Set();
+      const matchedDetections = new Set();
+      for (const { ti, di } of pairs) {
+        if (matchedTracks.has(ti) || matchedDetections.has(di)) continue;
+        matchedTracks.add(ti);
+        matchedDetections.add(di);
+        const t = tracks[ti];
+        const d = detections[di];
+        t.vx = 0.5 * t.vx + 0.5 * (d.x + d.w / 2 - (t.x + t.w / 2));
+        t.vy = 0.5 * t.vy + 0.5 * (d.y + d.h / 2 - (t.y + t.h / 2));
+        Object.assign(t, { x: d.x, y: d.y, w: d.w, h: d.h, hits: t.hits + 1, lastSeen: now, held: false });
+      }
+
+      tracks = tracks.filter((t, ti) => {
+        if (matchedTracks.has(ti)) return true;
+        // It stopped: hold it where it was last seen.
+        t.vx = t.vy = 0;
+        t.held = true;
+        return t.hits >= opts.minHits; // an unconfirmed one-frame blip was just noise
+      });
+      detections.forEach((d, di) => {
+        if (!matchedDetections.has(di)) tracks.push({ ...d, vx: 0, vy: 0, hits: 1, lastSeen: now, held: false, id: nextId++ });
+      });
+      mergeOverlappingTracks(now);
+    }
+
+    // A stopped target still flickers with small differences on its edges, because no camera-motion
+    // estimate lines frames up perfectly. Detections well inside a held box, and clearly smaller than
+    // it, are swallowed so they neither shrink the box nor spawn new targets; the hold timer keeps
+    // running. A detection the size of the target, or reaching outside the box (the target moving
+    // off again), still matches normally.
+    function absorbIntoHeld(detections) {
+      const margin = 0.02 * Math.max(width, height);
+      const held = tracks.filter((t) => t.held);
+      if (!held.length) return detections;
+      return detections.filter((d) => !held.some((t) =>
+        d.w * d.h < 0.7 * t.w * t.h &&
+        d.x >= t.x - margin && d.y >= t.y - margin &&
+        d.x + d.w <= t.x + t.w + margin && d.y + d.h <= t.y + t.h + margin));
+    }
+
+    // A target can break into fragments and rejoin. Overlapping tracks collapse into the one seen
+    // most often; if both moved this frame their boxes are combined.
+    function mergeOverlappingTracks(now) {
+      tracks.sort((a, b) => b.hits - a.hits);
+      const kept = [];
+      for (const t of tracks) {
+        const owner = kept.find((k) => overlaps(k, t, 0));
+        if (!owner) {
+          kept.push(t);
+        } else if (owner.lastSeen === now && t.lastSeen === now) {
+          const x = Math.min(owner.x, t.x);
+          const y = Math.min(owner.y, t.y);
+          owner.w = Math.max(owner.x + owner.w, t.x + t.w) - x;
+          owner.h = Math.max(owner.y + owner.h, t.y + t.h) - y;
+          owner.x = x;
+          owner.y = y;
+        }
+      }
+      tracks = kept;
+    }
+
+    function expireTracks(now) {
+      tracks = tracks.filter((t) => now - t.lastSeen <= opts.holdMs);
+      if (tracks.length > opts.maxTracks) {
+        tracks.sort((a, b) => b.lastSeen - a.lastSeen);
+        tracks.length = opts.maxTracks;
+      }
+    }
+
+    function reportTracks(now) {
+      return tracks
+        .filter((t) => t.hits >= opts.minHits)
+        .map((t) => {
+          const x = Math.max(0, Math.round(t.x));
+          const y = Math.max(0, Math.round(t.y));
+          return {
+            x,
+            y,
+            w: Math.min(width, Math.round(t.x + t.w)) - x,
+            h: Math.min(height, Math.round(t.y + t.h)) - y,
+            held: t.lastSeen !== now,
+            id: t.id,
+          };
+        });
     }
 
     /**
-     * Process one RGBA frame. Returns { boxes, mode, features, inliers }, with boxes in frame pixels.
+     * Process one RGBA frame captured at time `now` (ms). Returns { boxes, mode, features, inliers }.
+     * Boxes are in frame pixels; `held` marks targets that have stopped moving.
      * mode: 'init' (first frame), 'ok', 'lost' (camera moved too fast to track), 'noisy' (too much changed).
      */
-    function processFrame(data, w, h) {
+    function processFrame(data, w, h, now = Date.now()) {
       if (w !== width || h !== height) allocate(w, h);
       rgba.data.set(data);
       cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY);
@@ -241,11 +367,13 @@
       }
 
       const { H, features, inliers } = estimateCameraMotion();
+      expireTracks(now);
       if (!H) {
+        // Can't tell where the camera went; leave held boxes where they are until it settles.
         gray.copyTo(prevGray);
-        prevBoxes = [];
-        return { boxes: [], mode: 'lost', features, inliers };
+        return { boxes: reportTracks(now), mode: 'lost', features, inliers };
       }
+      if (H !== identity) moveTracks(H.data64F.slice());
 
       const size = new cv.Size(width, height);
       const black = new cv.Scalar(0);
@@ -257,7 +385,15 @@
 
       matchBrightness();
 
-      cv.absdiff(gray, warped, motion);
+      // A pixel only counts as changed if it falls outside the brightness range of its 3x3
+      // neighbourhood in the aligned previous frame. This forgives up to 1 px of misalignment, which
+      // otherwise flickers on every sharp edge; real movers shift more than that against their
+      // surroundings. Kept at 3x3 at every size so small, slow movers still register.
+      cv.erode(warped, warpedMin, kernelOpen);
+      cv.dilate(warped, warpedMax, kernelOpen);
+      cv.subtract(gray, warpedMax, above); // saturates at 0: only where brighter than any neighbour
+      cv.subtract(warpedMin, gray, motion); // only where darker than any neighbour
+      cv.add(motion, above, motion);
       cv.threshold(motion, motion, opts.threshold, 255, cv.THRESH_BINARY);
       cv.bitwise_and(motion, warpedValid, motion);
       cv.morphologyEx(motion, motion, cv.MORPH_OPEN, kernelOpen);
@@ -266,10 +402,10 @@
       gray.copyTo(prevGray);
 
       if (cv.countNonZero(groups) > opts.maxChangedArea * width * height) {
-        prevBoxes = [];
-        return { boxes: [], mode: 'noisy', features, inliers };
+        return { boxes: reportTracks(now), mode: 'noisy', features, inliers };
       }
-      return { boxes: confirm(findBoxes()), mode: 'ok', features, inliers };
+      updateTracks(findBoxes(), now);
+      return { boxes: reportTracks(now), mode: 'ok', features, inliers };
     }
 
     // Phones adjust exposure as the scene changes, brightening or darkening the whole frame.

@@ -32,7 +32,7 @@ onmessage = ({ data: msg }) => {
   } else if (msg.type === 'frame' && detector) {
     const t0 = performance.now();
     try {
-      const r = detector.processFrame(new Uint8ClampedArray(msg.buffer), msg.width, msg.height);
+      const r = detector.processFrame(new Uint8ClampedArray(msg.buffer), msg.width, msg.height, t0);
       postMessage({ type: 'result', ...r, ms: performance.now() - t0 });
     } catch (e) {
       // OpenCV.js throws numeric pointers for C++ exceptions.

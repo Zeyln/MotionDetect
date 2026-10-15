@@ -17,7 +17,7 @@ const SETTINGS_KEY = 'motiondetect.settings';
 // Bump when a default changes in a way that should override what's saved on the phone.
 const SETTINGS_VERSION = 2;
 const settings = Object.assign(
-  { sensitivity: 6, minSize: 3, detail: 800, showStats: false, facing: 'environment' },
+  { sensitivity: 6, minSize: 3, holdSeconds: 3, detail: 800, showStats: false, facing: 'environment' },
   loadSettings(),
   { version: SETTINGS_VERSION }
 );
@@ -58,7 +58,10 @@ function saveSettings() {
 function detectorOptions() {
   return {
     threshold: Math.round(60 - 5 * settings.sensitivity), // 55 (least sensitive) .. 10 (most)
-    minArea: 0.0005 * Math.pow(1.8, settings.minSize - 1), // 0.05% .. ~10% of the frame
+    // Area of the motion box as a fraction of the frame: 3 is about 6x6 px at 800 px; 1 lets
+    // through specks of a couple of pixels, 10 only things covering several percent of the view.
+    minArea: 0.0001 * Math.pow(2.4, settings.minSize - 3),
+    holdMs: settings.holdSeconds * 1000,
   };
 }
 
@@ -67,6 +70,8 @@ function applySettings() {
   $('sensitivity-out').textContent = settings.sensitivity;
   $('min-size').value = settings.minSize;
   $('min-size-out').textContent = settings.minSize;
+  $('hold').value = settings.holdSeconds;
+  $('hold-out').textContent = settings.holdSeconds ? settings.holdSeconds + ' s' : 'off';
   $('detail').value = String(settings.detail);
   $('show-stats').checked = settings.showStats;
   hud.hidden = !settings.showStats || !running;
@@ -76,6 +81,7 @@ function applySettings() {
 $('settings').addEventListener('input', () => {
   settings.sensitivity = Number($('sensitivity').value);
   settings.minSize = Number($('min-size').value);
+  settings.holdSeconds = Number($('hold').value);
   settings.detail = Number($('detail').value);
   settings.showStats = $('show-stats').checked;
   saveSettings();
@@ -253,7 +259,8 @@ function draw() {
   if (settings.showStats && running) {
     const note = lastMode === 'lost' ? ' · moving too fast' : lastMode === 'noisy' ? ' · unstable' : '';
     hud.textContent =
-      `${stats.fps.toFixed(0)} fps · ${stats.ms.toFixed(0)} ms · ${stats.inliers} pts · ${boxes.length} boxes${note}`;
+      `${stats.fps.toFixed(0)} fps · ${stats.ms.toFixed(0)} ms · ${stats.inliers} pts · ` +
+      `${boxes.filter((b) => !b.held).length} moving · ${boxes.filter((b) => b.held).length} held${note}`;
   }
   if (!boxes.length || !video.videoWidth) return;
 
@@ -263,12 +270,21 @@ function draw() {
   const offY = (H - boxesFrame.h * scale) / 2;
   const dpr = window.devicePixelRatio || 1;
 
+  // Small targets (a distant bird) still get a box big enough to see.
+  const minSide = 20 * dpr;
   overlayCtx.strokeStyle = '#ff2020';
   overlayCtx.lineWidth = 3 * dpr;
   overlayCtx.lineJoin = 'miter';
   for (const b of boxes) {
-    overlayCtx.strokeRect(offX + b.x * scale, offY + b.y * scale, b.w * scale, b.h * scale);
+    const w = Math.max(minSide, b.w * scale);
+    const h = Math.max(minSide, b.h * scale);
+    const x = offX + (b.x + b.w / 2) * scale - w / 2;
+    const y = offY + (b.y + b.h / 2) * scale - h / 2;
+    // Targets that have stopped moving keep a dashed box until the hold time runs out.
+    overlayCtx.setLineDash(b.held ? [8 * dpr, 6 * dpr] : []);
+    overlayCtx.strokeRect(x, y, w, h);
   }
+  overlayCtx.setLineDash([]);
 }
 
 // ---------- Boot ----------

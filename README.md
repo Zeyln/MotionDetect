@@ -8,11 +8,12 @@ A phone web app (PWA) that shows the camera and draws red boxes around anything 
 
 1. The frame is downscaled so its long side is 480–960 px (set under **Detail**) and converted to grayscale.
 2. **Camera motion.** Up to 400 corner features are tracked from the previous frame with Lucas–Kanade optical flow, then tracked back again. Points that don't return to where they started are discarded. A RANSAC homography is fitted to the rest. Background points agree with each other, so the fit describes how the camera moved. Points on moving objects are rejected as outliers.
-3. The previous frame is warped onto the current one and brightness-matched to it, which cancels the phone's automatic exposure changes. Then the two are subtracted. Anything still different moved by itself.
+3. The previous frame is warped onto the current one and brightness-matched to it, which cancels the phone's automatic exposure changes. A pixel counts as changed only if it falls outside the brightness range of its 3×3 neighbourhood in that aligned frame. This forgives up to 1 px of misalignment, which would otherwise flicker on every sharp edge. Anything still different moved by itself.
 4. The difference is thresholded (**Sensitivity**) and cleaned with morphology. Nearby blobs are grouped using a padded copy of the mask, but each box is fitted to the exact changed pixels, so it hugs the object. Blobs below **Minimum size** are dropped.
-5. A box is shown only if it overlaps a box from the previous frame, which suppresses one-frame flicker.
+5. **Target tracking.** Each box is matched to a known target by its predicted position (last position plus velocity). A target is shown once it has been seen in two frames, which filters out one-frame noise.
+6. **Held targets.** When a target stops moving, its box stays, drawn dashed, for the **Keep boxes after stopping** time. Each frame the box is moved by the camera's motion, so it stays on the target while you pan. If the target moves off again, the box goes solid and follows it. Small flickers inside a held box don't shrink it or create new targets.
 
-All pixel-based tuning (kernel sizes, feature spacing, tracking tolerances) is set for a 320 px frame and scales with the processing resolution, so changing **Detail** doesn't change how sensitive the detector is.
+Kernel sizes, feature spacing and tracking tolerances are set for a 320 px frame and scale with the processing resolution. The noise filter and the misalignment allowance stay at 3×3 px at every resolution, so small and thin movers (a distant bird, a mouse cursor) aren't erased.
 
 Safeguards:
 
@@ -55,11 +56,12 @@ On the phone, tap **Start camera** and allow camera access. To install it like a
 | `detector.js` | The motion-compensated detection pipeline |
 | `sw.js`, `manifest.webmanifest`, `icons/` | PWA install and offline support |
 | `serve.js` | Dependency-free local static server |
-| `test/detector.test.js` | Tests at 320 and 640 px: still/panning camera × object/no object, a plain-wall scene, a sudden exposure change, and box tightness |
+| `test/detector.test.js` | Tests at 320 and 640 px with sensor noise: still/panning camera × object/no object, a plain-wall scene, a sudden exposure change, a tiny object, targets that stop (held boxes, also while panning), hold expiry, and box tightness |
 
 ## Tuning
 
 - **Sensitivity** lowers the brightness difference that counts as motion. Raise it to catch subtle movement; lower it if lighting flicker causes false boxes.
-- **Minimum size** ignores small blobs such as leaves or noise.
+- **Minimum size** ignores small blobs such as leaves or noise. At the default (3), anything about 6×6 px in the processed frame counts; lower it to catch even smaller specks.
+- **Keep boxes after stopping** sets how long a box stays on a target after it stops moving (0–10 s, default 3 s; 0 turns holding off). Held boxes are dashed.
 - **Detail** sets the processing resolution (long side). Higher resolution catches smaller or more distant movement but uses more battery. The default is High (800 px). If **Show stats** reports under about 20 fps, step down a level.
-- **Show stats** shows fps, per-frame time, the number of background points used for camera tracking, and the box count.
+- **Show stats** shows fps, per-frame time, the number of background points used for camera tracking, and how many targets are moving and held.
