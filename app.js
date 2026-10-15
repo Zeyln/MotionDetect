@@ -75,6 +75,7 @@ let wakeLock = null;
 let boxes = [];
 let boxesFrame = { w: 1, h: 1 }; // size of the frame the heat was computed on
 let lastMode = 'init';
+let lastFrameTime = null; // capture time of the last camera frame used, to skip repeats
 const stats = { frames: 0, since: performance.now(), fps: 0, ms: 0, inliers: 0 };
 const extractor = createExtractor();
 const camera = { frames: 0, since: performance.now(), fps: 30 }; // camera frame rate, for the Delay label
@@ -322,6 +323,7 @@ async function startCamera() {
   boxes = [];
   heat = null;
   frameReady = false;
+  lastFrameTime = null;
   extractor.reset();
   if (worker) worker.postMessage({ type: 'reset' });
   $('start-screen').hidden = true;
@@ -389,8 +391,17 @@ function scheduleFrame() {
   else requestAnimationFrame(onFrame);
 }
 
-function onFrame() {
+function onFrame(now, meta) {
   if (running !== true) return;
+  // The callback can fire on every screen refresh while the camera delivers fewer new pictures
+  // (an iPhone drops to ~20 fps in dim light), handing over the same picture several times. A repeat
+  // compared with itself shows no motion at all, so only frames with a new capture time are used.
+  const t = meta ? meta.captureTime ?? meta.mediaTime : undefined;
+  if (t !== undefined && t === lastFrameTime) {
+    scheduleFrame();
+    return;
+  }
+  lastFrameTime = t ?? null;
   countCameraFrame();
   if (settings.mode === 'extract') {
     extractor.push(video);
