@@ -33,7 +33,7 @@
     minHoldHits: 5,       // frames a target must be seen in before it is held after stopping
     holdMs: 3000,         // how long a target stays boxed after it stops moving
     matchDistance: 0.06,  // extra distance (fraction of frame size) a target may jump between frames
-    maxCoastFrames: 5,    // frames a fast target that went unseen keeps moving along its path
+    maxCoastFrames: 2,    // frames a very fast target that went unseen is followed (hidden) along its path
     maxTracks: 30,
     maxCorners: 300,      // at 320 px; scales with frame size up to 400
     minFeatures: 12,      // fewer tracked points than this: camera motion can't be trusted
@@ -310,11 +310,15 @@
       tracks = tracks.filter((t, ti) => {
         if (matchedTracks.has(ti)) return true;
         if (t.held) return true;
-        // Unseen this frame. A target that was moving fast has most likely just been missed (it
-        // blended into the background, or the frame was blurred), not stopped: keep it moving along
-        // its path for a few frames so the same target picks it up again.
+        // Unseen this frame. A target that was moving against the background may just have been
+        // missed (it blended in, or the frame was blurred). Follow its slowing path for a couple of
+        // frames (see reportTracks for when it is shown) so the same target picks it up again instead
+        // of leaving a held box behind and starting a new one. If it isn't found, it is held where it
+        // was last seen, as if it had stopped there.
         const speed = Math.hypot(t.vx, t.vy);
         if (t.coast < opts.maxCoastFrames && speed > Math.max(slowSpeed, 0.25 * Math.max(t.w, t.h))) {
+          t.vx *= 0.7;
+          t.vy *= 0.7;
           t.x += t.vx;
           t.y += t.vy;
           t.cx += t.vx;
@@ -322,6 +326,9 @@
           t.coast++;
           return t.hits >= opts.minHits;
         }
+        // Its path took it to the edge of the frame (within one box size): it has left, so there is
+        // nothing to hold.
+        if (t.coast && (t.x < t.w || t.y < t.h || t.x + 2 * t.w > width || t.y + 2 * t.h > height)) return false;
         // It stopped (or wasn't found again): hold it where it was last seen.
         t.x -= t.cx;
         t.y -= t.cy;
@@ -385,7 +392,11 @@
 
     function reportTracks(now) {
       return tracks
-        .filter((t) => t.hits >= opts.minHits)
+        // A coasting target is shown at its predicted position only while that is less than its own
+        // size away from where it was last seen (so the box still overlaps it, e.g. a bird you are
+        // following with the camera). Further than that is too much of a guess: nothing is shown
+        // until it is seen again or held.
+        .filter((t) => t.hits >= opts.minHits && (!t.coast || Math.hypot(t.cx, t.cy) < Math.max(t.w, t.h)))
         .map((t) => {
           const x = Math.max(0, Math.round(t.x));
           const y = Math.max(0, Math.round(t.y));

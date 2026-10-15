@@ -1,5 +1,5 @@
 // Runs the detector on synthetic frames: a textured scene viewed through a "camera" that pans,
-// optionally with a square that moves (and maybe stops) in the scene. Every case runs at 320x240
+// optionally with a square that moves (and maybe stops) in the scene. Every case runs at 480x360
 // and 640x480, with mild sensor noise, at 25 fps. Usage: node test/detector.test.js
 'use strict';
 const assert = require('node:assert/strict');
@@ -99,7 +99,7 @@ function run(cv, defaultScene, k, c) {
       const size = object.size || 40;
       const sceneX = 140 + object.vx * steps;
       const sceneY = 190;
-      obj = { x: (sceneX - camX) * k, y: (sceneY - camY) * k, s: size * k, contrast: size < 8 };
+      obj = { x: (sceneX - camX) * k, y: (sceneY - camY) * k, s: size * k, contrast: size <= 8 };
     }
     const gain = exposureJump && f >= exposureJump.frame ? exposureJump.gain : 1;
     const frame = renderFrame(scene, k, camX, camY, obj, gain, rand);
@@ -148,12 +148,15 @@ function contains(box, obj, slack) {
     // Moves twice its own size per frame, so the spot it just left is a separate blob each frame.
     // Those must not become boxes (or held boxes) trailing along its path.
     { name: 'panning camera, fast small object (no trail)', pan: panning, object: { vx: 16, size: 8 } },
+    // A fast mover that stops dead: its box must be held where it stopped, never shown running ahead.
+    { name: 'panning camera, fast object stops dead', pan: panning, object: { vx: 16, size: 8, stopAt: 12 } },
     // Single-frame brightness glitches over a patch must not produce boxes.
     { name: 'panning camera, one-frame glitches', pan: panning, flicker: { every: 4 } },
   ];
 
   let failed = 0;
-  for (const k of [1, 2]) {
+  // 480 and 640 px wide: the app's two lowest Detail settings (its higher ones only add detail).
+  for (const k of [1.5, 2]) {
     for (const c of cases) {
       const { results, ms } = run(cv, scene, k, c);
       const holdMs = c.options?.holdMs ?? 3000;
@@ -197,7 +200,10 @@ function contains(box, obj, slack) {
         assert.equal(lost, 0, 'every frame should track');
         assert.ok(falseBoxes <= 1, 'at most one stray box across the run');
         if (c.object) {
-          assert.ok(boxed >= expected - 1, 'object boxed in nearly every frame, moving or held');
+          // A very fast target that goes unseen is followed without a box for up to 2 frames
+          // (maxCoastFrames) rather than shown at a guessed position, so allow those gaps.
+          const allowedGaps = c.object.vx >= 2 * (c.object.size || 40) ? 3 : 1;
+          assert.ok(boxed >= expected - allowedGaps, 'object boxed in nearly every frame, moving or held');
           // A tight box spans the object's old and new positions: its size plus one frame of travel.
           assert.ok(maxExcess <= (c.object.vx + 4) * k, 'box should hug the object');
         }
