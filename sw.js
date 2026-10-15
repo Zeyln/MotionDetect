@@ -1,10 +1,11 @@
 // Offline support. App files are network-first so edits show up on reload;
 // the 10 MB OpenCV.js file is cache-first since it never changes.
-const CACHE = 'motiondetect-v2';
+const CACHE = 'motiondetect-v3';
 const APP_FILES = [
   './',
   'index.html',
   'styles.css',
+  'outline.js',
   'app.js',
   'worker.js',
   'imgproc.js',

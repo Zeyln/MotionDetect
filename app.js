@@ -42,9 +42,8 @@ const settings = Object.assign(
   {
     sensitivity: 6,
     minSize: 3,
-    display: 'heatmap', // 'heatmap', 'boxes' or 'both'
+    display: 'heatmap', // 'heatmap', 'outline' or 'both'
     heatFade: 1, // seconds
-    holdSeconds: 3,
     detail: 800,
     syncVideo: true,
     showStats: false,
@@ -74,6 +73,8 @@ function loadSettings() {
     const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {};
     // Version 1 stored `detail` as frame width; it is now the long side, with new options.
     if (saved.version !== SETTINGS_VERSION) delete saved.detail;
+    // Rectangular boxes were replaced by outlines of the heat.
+    if (saved.display === 'boxes') saved.display = 'outline';
     return saved;
   } catch {
     return {};
@@ -95,8 +96,7 @@ function detectorOptions() {
     // Area of the motion box as a fraction of the frame: 3 is about 6x6 px at 800 px; 1 lets
     // through specks of a couple of pixels, 10 only things covering several percent of the view.
     minArea: 0.0001 * Math.pow(2.4, settings.minSize - 3),
-    holdMs: settings.holdSeconds * 1000,
-    heatmap: settings.display !== 'boxes',
+    heatmap: true, // both displays are drawn from the heat
     heatFadeMs: settings.heatFade * 1000,
   };
 }
@@ -106,14 +106,9 @@ function applySettings() {
   $('sensitivity-out').textContent = settings.sensitivity;
   $('min-size').value = settings.minSize;
   $('min-size-out').textContent = settings.minSize;
-  $('hold').value = settings.holdSeconds;
-  $('hold-out').textContent = settings.holdSeconds ? settings.holdSeconds + ' s' : 'off';
   $('display').value = settings.display;
   $('heat-fade').value = settings.heatFade;
   $('heat-fade-out').textContent = settings.heatFade + ' s';
-  // Only show the settings that apply to the chosen display.
-  $('heat-fade-row').hidden = settings.display === 'boxes';
-  $('hold-row').hidden = settings.display === 'heatmap';
   $('detail').value = String(settings.detail);
   $('sync-video').checked = settings.syncVideo;
   $('show-stats').checked = settings.showStats;
@@ -126,7 +121,6 @@ function applySettings() {
 $('settings').addEventListener('input', () => {
   settings.sensitivity = Number($('sensitivity').value);
   settings.minSize = Number($('min-size').value);
-  settings.holdSeconds = Number($('hold').value);
   settings.display = $('display').value;
   settings.heatFade = Number($('heat-fade').value);
   settings.detail = Number($('detail').value);
@@ -370,9 +364,7 @@ function draw() {
     const note = lastMode === 'lost' ? ' · moving too fast' : lastMode === 'noisy' ? ' · unstable' : '';
     hud.textContent =
       `${stats.fps.toFixed(0)} fps · ${stats.ms.toFixed(0)} ms · ${stats.inliers} pts · ` +
-      (settings.display === 'heatmap'
-        ? `${boxes.filter((b) => !b.held).length} moving${note}`
-        : `${boxes.filter((b) => !b.held).length} moving · ${boxes.filter((b) => b.held).length} held${note}`);
+      `${boxes.filter((b) => !b.held).length} moving${note}`;
   }
   if (!video.videoWidth) return;
 
@@ -382,24 +374,48 @@ function draw() {
   const offY = (H - boxesFrame.h * scale) / 2;
   const dpr = window.devicePixelRatio || 1;
 
-  if (settings.display !== 'boxes' && heat) drawHeat(offX, offY, boxesFrame.w * scale, boxesFrame.h * scale);
-  if (settings.display === 'heatmap' || !boxes.length) return;
+  if (!heat) return;
+  const fw = boxesFrame.w * scale;
+  const fh = boxesFrame.h * scale;
+  if (settings.display !== 'outline') drawHeat(offX, offY, fw, fh);
+  if (settings.display !== 'heatmap') drawOutlines(offX, offY, fw, fh, dpr);
+}
 
-  // Small targets (a distant bird) still get a box big enough to see.
-  const minSide = 20 * dpr;
-  overlayCtx.strokeStyle = '#ff2020';
-  overlayCtx.lineWidth = 3 * dpr;
-  overlayCtx.lineJoin = 'miter';
+// Heat level (of 255) the outline follows: about where the heatmap's glow becomes clearly visible.
+const OUTLINE_LEVEL = 40;
+
+// Outlines the areas the heatmap covers. Areas with motion right now get a solid red line; areas
+// that are only fading (the target stopped or left) get a fainter one until their heat is gone.
+function drawOutlines(x, y, w, h, dpr) {
+  const { segments, segmentAreas, labels, count } = outline.trace(heat.data, heat.w, heat.h, OUTLINE_LEVEL);
+  if (!segments.length) return;
+  // An area is "moving" if a target was seen in it this frame.
+  const moving = new Uint8Array(count + 1);
+  const s = heat.w / boxesFrame.w;
   for (const b of boxes) {
-    const w = Math.max(minSide, b.w * scale);
-    const h = Math.max(minSide, b.h * scale);
-    const x = offX + (b.x + b.w / 2) * scale - w / 2;
-    const y = offY + (b.y + b.h / 2) * scale - h / 2;
-    // Targets that have stopped moving keep a dashed box until the hold time runs out.
-    overlayCtx.setLineDash(b.held ? [8 * dpr, 6 * dpr] : []);
-    overlayCtx.strokeRect(x, y, w, h);
+    if (b.held) continue;
+    const x0 = Math.max(0, Math.floor(b.x * s));
+    const y0 = Math.max(0, Math.floor(b.y * s));
+    const x1 = Math.min(heat.w, Math.ceil((b.x + b.w) * s));
+    const y1 = Math.min(heat.h, Math.ceil((b.y + b.h) * s));
+    for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) moving[labels[yy * heat.w + xx]] = 1;
   }
-  overlayCtx.setLineDash([]);
+  const sx = w / heat.w;
+  const sy = h / heat.h;
+  const solid = new Path2D();
+  const faint = new Path2D();
+  for (let i = 0; i < segmentAreas.length; i++) {
+    const path = moving[segmentAreas[i]] ? solid : faint;
+    path.moveTo(x + segments[4 * i] * sx, y + segments[4 * i + 1] * sy);
+    path.lineTo(x + segments[4 * i + 2] * sx, y + segments[4 * i + 3] * sy);
+  }
+  overlayCtx.lineWidth = 3 * dpr;
+  overlayCtx.lineCap = 'round';
+  overlayCtx.lineJoin = 'round';
+  overlayCtx.strokeStyle = 'rgba(255, 32, 32, 0.45)';
+  overlayCtx.stroke(faint);
+  overlayCtx.strokeStyle = '#ff2020';
+  overlayCtx.stroke(solid);
 }
 
 // Colours the heatmap and stretches it over the picture; smoothing while scaling it up gives the

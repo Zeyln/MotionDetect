@@ -37,15 +37,12 @@
     <label>Display
       <select id="display">
         <option value="heatmap">Heatmap</option>
-        <option value="boxes">Boxes</option>
-        <option value="both">Heatmap and boxes</option>
+        <option value="outline">Outline</option>
+        <option value="both">Heatmap and outline</option>
       </select>
     </label>
-    <label id="heat-fade-row">Heat fade <output id="heat-fade-out"></output>
-      <input id="heat-fade" type="range" min="0.2" max="5" step="0.1">
-    </label>
-    <label id="hold-row">Keep boxes after stopping <output id="hold-out"></output>
-      <input id="hold" type="range" min="0" max="10" step="0.5">
+    <label>Fade time <output id="heat-fade-out"></output>
+      <input id="heat-fade" type="range" min="0.2" max="10" step="0.1">
     </label>
     <label>Detail
       <select id="detail">
@@ -66,6 +63,7 @@
     <p id="message" role="alert"></p>
   </div>
 
+  <script src="outline.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

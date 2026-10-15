@@ -5,6 +5,6 @@
   "description": "Phone web app that boxes moving objects in the camera view, compensating for camera motion.",
   "scripts": {
     "start": "node serve.js",
-    "test": "node test/detector.test.js"
+    "test": "node test/outline.test.js && node test/detector.test.js"
   }
 }

@@ -1,6 +1,6 @@
 # MotionDetect
 
-A phone web app (PWA) that shows the camera and highlights anything moving in the shot, as a heatmap, red boxes, or both. It runs whenever the camera view is open, without recording, and it compensates for the phone itself moving.
+A phone web app (PWA) that shows the camera and highlights anything moving in the shot, as a heatmap, a red outline around it, or both. It runs whenever the camera view is open, without recording, and it compensates for the phone itself moving.
 
 ## How detection works
 
@@ -12,9 +12,10 @@ A phone web app (PWA) that shows the camera and highlights anything moving in th
 4. **Three-frame confirmation.** The frame before last is aligned too, using the camera motion over both steps. A blob is kept only if some of its pixels also differ from that frame, and its box is fitted to those pixels. The spot an object has just left looks the same as two frames ago, so it doesn't leave a ghost box behind, and a glitch in a single frame (a reflection, a compression artifact) is ignored.
 5. The difference is thresholded (**Sensitivity**) and cleaned with morphology. Nearby blobs are grouped using a padded copy of the mask, but each box is fitted to the exact changed pixels, so it hugs the object. Blobs below **Minimum size** are dropped.
 6. **Target tracking.** Each box is matched to a known target by its predicted position (last position plus velocity). A target is shown once it has been seen in three frames, which filters out short flickers. If a moving target goes unseen for a moment (it blends into the background, or the frame is blurred), the tracker follows its predicted, slowing path for up to 2 frames, so the same target picks it up again instead of a new one. The predicted box is only drawn while it is less than the target's own size from where it was last seen (it still overlaps the target); beyond that nothing is drawn until the target is seen again or held. A target whose path leads out of the frame is dropped rather than held at the edge.
-7. **Held targets.** When a target stops moving, its box stays, drawn dashed, for the **Keep boxes after stopping** time. Only targets that were followed for at least 5 frames are held, so short-lived fragments and flickers just disappear. Each frame the box is moved by the camera's motion, so it stays on the target while you pan. If the target moves off again, the box goes solid and follows it. Small flickers inside a held box don't shrink it or create new targets.
+7. **Stopped targets.** When a target stops moving the tracker keeps it for a few seconds, moved along with the camera, so leftover flicker on its edges doesn't create new targets, and it is picked up again as the same target if it moves off. Only targets followed for at least 5 frames are kept, so short-lived fragments and flickers just disappear. (What you see after a target stops is its fading heat; see **Fade time**.)
 
-8. **Heatmap.** The motion pixels of confirmed targets seen in a frame are added as heat. Heat fades over the **Heat fade** time and is shifted with the camera's motion every frame, so it stays where the motion happened in the scene. It is sent to the app at a quarter of the frame size and coloured from transparent through red to yellow. Because it only comes from confirmed targets, it gets the same noise filtering as the boxes.
+8. **Heatmap.** The motion pixels of confirmed targets seen in a frame are added as heat. Heat fades over the **Heat fade** time and is shifted with the camera's motion every frame, so it stays where the motion happened in the scene. It is sent to the app at a quarter of the frame size and coloured from transparent through red to yellow. Because it only comes from confirmed targets, it gets the same noise filtering as the tracker.
+9. **Outline.** The app traces the edge of the area the heatmap covers (marching squares at heat level 40 of 255, in `outline.js`), so the line follows the moving thing's shape. Areas with a target seen in the current frame get a solid red line; areas that are only fading get a fainter one until their heat is gone.
 
 Kernel sizes, feature spacing and tracking tolerances are set for a 320 px frame and scale with the processing resolution. The noise filter and the misalignment allowance stay at 3×3 px at every resolution, so small and thin movers (a distant bird, a mouse cursor) aren't erased.
 
@@ -27,7 +28,7 @@ Safeguards:
 
 ```sh
 npm start          # serves on http://localhost:8080
-npm test           # synthetic-frame tests for the detector (Node, no browser)
+npm test           # outline tests and synthetic-frame tests for the detector (Node, no browser)
 ```
 
 On a computer with a webcam, `http://localhost:8080` works directly in the browser.
@@ -54,7 +55,8 @@ On the phone, tap **Start camera** and allow camera access. To install it like a
 | File | Role |
 | --- | --- |
 | `index.html`, `styles.css` | Full-screen camera view, controls, settings sheet |
-| `app.js` | Camera, frame capture, worker messaging, box drawing, settings |
+| `app.js` | Camera, frame capture, worker messaging, heatmap and outline drawing, settings |
+| `outline.js` | Traces the heatmap's outline (marching squares) and labels its areas |
 | `worker.js` | Loads OpenCV.js and runs the detector off the main thread |
 | `imgproc.js` | Plain-JavaScript image operations: blur, warp, min/max filters, pyramids, corner detection, Lucas–Kanade tracking |
 | `detector.js` | The motion-compensated detection pipeline |
@@ -66,9 +68,8 @@ On the phone, tap **Start camera** and allow camera access. To install it like a
 
 - **Sensitivity** lowers the brightness difference that counts as motion. Raise it to catch subtle movement; lower it if lighting flicker causes false boxes.
 - **Minimum size** ignores small blobs such as leaves or noise. At the default (3), anything about 6×6 px in the processed frame counts; lower it to catch even smaller specks.
-- **Display** chooses **Heatmap** (default), **Boxes**, or **Heatmap and boxes**.
-- **Heat fade** sets how long heat takes to fade (0.2–5 s, default 1 s). Short values give a tight glow on what's moving now; long ones leave a trail showing where things went.
-- **Keep boxes after stopping** sets how long a box stays on a target after it stops moving (0–10 s, default 3 s; 0 turns holding off). Held boxes are dashed.
+- **Display** chooses **Heatmap** (default), **Outline**, or **Heatmap and outline**.
+- **Fade time** sets how long heat, and with it the outline, takes to fade after motion stops (0.2–10 s, default 1 s). Short values show only what's moving now; long ones keep marking where things moved or stopped.
 - **Detail** sets the processing resolution (long side). Higher resolution catches smaller or more distant movement but uses more battery. The default is High (800 px). If **Show stats** reports under about 20 fps, step down a level.
 - **Sync video with boxes** (on by default) shows each analysed frame together with its boxes, so they line up exactly with the picture. The picture then runs one frame behind the live camera and updates at the detector's frame rate (the fps in **Show stats**). Turn it off for the smoother live picture, with boxes trailing fast movers slightly.
-- **Show stats** shows fps, per-frame time, the number of background points used for camera tracking, and how many targets are moving and held.
+- **Show stats** shows fps, per-frame time, the number of background points used for camera tracking, and how many targets are moving.
