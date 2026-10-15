@@ -4,10 +4,10 @@ A phone web app (PWA) that shows the camera and highlights anything moving in th
 
 ## How detection works
 
-`detector.js` runs in a Web Worker. Its pixel work (blurs, warps, morphology, blob labelling, feature tracking) is plain JavaScript in `imgproc.js`; OpenCV.js (`vendor/opencv.js`, 4.10, about 10 MB) is only used to fit the camera motion to the tracked points. OpenCV.js's other operations run 10–20× slower in Firefox than in Chrome or Safari, while plain JavaScript is fast in all of them. Each frame goes through these steps:
+`detector.js` runs in a Web Worker using OpenCV.js (`vendor/opencv.js`, 4.10, about 10 MB). Each frame goes through these steps:
 
 1. The frame is downscaled so its long side is 480–960 px (set under **Detail**) and converted to grayscale.
-2. **Camera motion.** About 200 well-spread corner features (one per grid cell) are tracked from the previous frame with Lucas–Kanade optical flow, then tracked back again. Points that don't return to where they started are discarded. A RANSAC homography is fitted to the rest. Background points agree with each other, so the fit describes how the camera moved. Points on moving objects are rejected as outliers.
+2. **Camera motion.** Up to 400 corner features are tracked from the previous frame with Lucas–Kanade optical flow, then tracked back again. Points that don't return to where they started are discarded. A RANSAC homography is fitted to the rest. Background points agree with each other, so the fit describes how the camera moved. Points on moving objects are rejected as outliers.
 3. The previous frame is warped onto the current one and brightness-matched to it, which cancels the phone's automatic exposure changes. A pixel counts as changed only if it falls outside the brightness range of its 3×3 neighbourhood in that aligned frame. This forgives up to 1 px of misalignment, which would otherwise flicker on every sharp edge. Anything still different moved by itself.
 4. **Three-frame confirmation.** The frame before last is aligned too, using the camera motion over both steps. A blob is kept only if some of its pixels also differ from that frame, and its box is fitted to those pixels. The spot an object has just left looks the same as two frames ago, so it doesn't leave a ghost box behind, and a glitch in a single frame (a reflection, a compression artifact) is ignored.
 5. The difference is thresholded (**Sensitivity**) and cleaned with morphology. Nearby blobs are grouped using a padded copy of the mask, but each box is fitted to the exact changed pixels, so it hugs the object. Blobs below **Minimum size** are dropped.
@@ -58,7 +58,6 @@ On the phone, tap **Start camera** and allow camera access. To install it like a
 | `app.js` | Camera, frame capture, worker messaging, heatmap and outline drawing, settings |
 | `outline.js` | Traces the heatmap's outline (marching squares) and labels its areas |
 | `worker.js` | Loads OpenCV.js and runs the detector off the main thread |
-| `imgproc.js` | Plain-JavaScript image operations: blur, warp, min/max filters, pyramids, corner detection, Lucas–Kanade tracking |
 | `detector.js` | The motion-compensated detection pipeline |
 | `sw.js`, `manifest.webmanifest`, `icons/` | PWA install and offline support |
 | `serve.js` | Dependency-free local static server |
