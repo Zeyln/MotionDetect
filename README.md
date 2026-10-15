@@ -9,9 +9,10 @@ A phone web app (PWA) that shows the camera and draws red boxes around anything 
 1. The frame is downscaled so its long side is 480–960 px (set under **Detail**) and converted to grayscale.
 2. **Camera motion.** Up to 400 corner features are tracked from the previous frame with Lucas–Kanade optical flow, then tracked back again. Points that don't return to where they started are discarded. A RANSAC homography is fitted to the rest. Background points agree with each other, so the fit describes how the camera moved. Points on moving objects are rejected as outliers.
 3. The previous frame is warped onto the current one and brightness-matched to it, which cancels the phone's automatic exposure changes. A pixel counts as changed only if it falls outside the brightness range of its 3×3 neighbourhood in that aligned frame. This forgives up to 1 px of misalignment, which would otherwise flicker on every sharp edge. Anything still different moved by itself.
-4. The difference is thresholded (**Sensitivity**) and cleaned with morphology. Nearby blobs are grouped using a padded copy of the mask, but each box is fitted to the exact changed pixels, so it hugs the object. Blobs below **Minimum size** are dropped.
-5. **Target tracking.** Each box is matched to a known target by its predicted position (last position plus velocity). A target is shown once it has been seen in two frames, which filters out one-frame noise.
-6. **Held targets.** When a target stops moving, its box stays, drawn dashed, for the **Keep boxes after stopping** time. Each frame the box is moved by the camera's motion, so it stays on the target while you pan. If the target moves off again, the box goes solid and follows it. Small flickers inside a held box don't shrink it or create new targets.
+4. **Three-frame confirmation.** The frame before last is aligned too, using the camera motion over both steps. A blob is kept only if some of its pixels also differ from that frame, and its box is fitted to those pixels. The spot an object has just left looks the same as two frames ago, so it doesn't leave a ghost box behind, and a glitch in a single frame (a reflection, a compression artifact) is ignored.
+5. The difference is thresholded (**Sensitivity**) and cleaned with morphology. Nearby blobs are grouped using a padded copy of the mask, but each box is fitted to the exact changed pixels, so it hugs the object. Blobs below **Minimum size** are dropped.
+6. **Target tracking.** Each box is matched to a known target by its predicted position (last position plus velocity). A target is shown once it has been seen in three frames, which filters out short flickers. If a fast-moving target goes unseen for a moment (it blends into the background, or the frame is blurred), its box keeps moving along its path for up to 5 frames, so the same target picks it up again instead of a new one.
+7. **Held targets.** When a target stops moving, its box stays, drawn dashed, for the **Keep boxes after stopping** time. Only targets that were followed for at least 5 frames are held, so short-lived fragments and flickers just disappear. Each frame the box is moved by the camera's motion, so it stays on the target while you pan. If the target moves off again, the box goes solid and follows it. Small flickers inside a held box don't shrink it or create new targets.
 
 Kernel sizes, feature spacing and tracking tolerances are set for a 320 px frame and scale with the processing resolution. The noise filter and the misalignment allowance stay at 3×3 px at every resolution, so small and thin movers (a distant bird, a mouse cursor) aren't erased.
 
@@ -56,7 +57,7 @@ On the phone, tap **Start camera** and allow camera access. To install it like a
 | `detector.js` | The motion-compensated detection pipeline |
 | `sw.js`, `manifest.webmanifest`, `icons/` | PWA install and offline support |
 | `serve.js` | Dependency-free local static server |
-| `test/detector.test.js` | Tests at 320 and 640 px with sensor noise: still/panning camera × object/no object, a plain-wall scene, a sudden exposure change, a tiny object, targets that stop (held boxes, also while panning), hold expiry, and box tightness |
+| `test/detector.test.js` | Tests at 320 and 640 px with sensor noise: still/panning camera × object/no object, a plain-wall scene, a sudden exposure change, a tiny object, a fast small object (no trail of boxes), one-frame glitches, targets that stop (held boxes, also while panning), hold expiry, and box tightness |
 
 ## Tuning
 

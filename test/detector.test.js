@@ -83,7 +83,7 @@ function renderFrame(scene, k, camX, camY, obj, gain, rand) {
 
 // object: { vx, size = 40, stopAt } in scene units per frame; it sits still from frame `stopAt` on.
 function run(cv, defaultScene, k, c) {
-  const { pan, object, scene = defaultScene, exposureJump = null, frames = 30, options } = c;
+  const { pan, object, scene = defaultScene, exposureJump = null, flicker = null, frames = 30, options } = c;
   const det = createDetector(cv, options);
   const rand = makeRandom(99);
   const results = [];
@@ -103,6 +103,12 @@ function run(cv, defaultScene, k, c) {
     }
     const gain = exposureJump && f >= exposureJump.frame ? exposureJump.gain : 1;
     const frame = renderFrame(scene, k, camX, camY, obj, gain, rand);
+    if (flicker && f % flicker.every === 2) {
+      // A one-frame glitch (light reflection, compression artifact) over a patch of the frame.
+      for (let y = 60 * k; y < 100 * k; y++)
+        for (let x = 200 * k; x < 260 * k; x++)
+          for (let ch = 0; ch < 3; ch++) frame[4 * (y * 320 * k + x) + ch] += 70;
+    }
     const t0 = performance.now();
     const r = det.processFrame(frame, 320 * k, 240 * k, f * FRAME_MS);
     ms += performance.now() - t0;
@@ -139,6 +145,11 @@ function contains(box, obj, slack) {
     { name: 'panning camera, object stops', pan: panning, object: { vx: 6, stopAt: 14 } },
     // Held boxes disappear once the hold time runs out (400 ms = 10 frames here).
     { name: 'held box expires', pan: still, object: { vx: 6, stopAt: 14 }, options: { holdMs: 400 } },
+    // Moves twice its own size per frame, so the spot it just left is a separate blob each frame.
+    // Those must not become boxes (or held boxes) trailing along its path.
+    { name: 'panning camera, fast small object (no trail)', pan: panning, object: { vx: 16, size: 8 } },
+    // Single-frame brightness glitches over a patch must not produce boxes.
+    { name: 'panning camera, one-frame glitches', pan: panning, flicker: { every: 4 } },
   ];
 
   let failed = 0;
@@ -163,6 +174,8 @@ function contains(box, obj, slack) {
           else falseBoxes++;
         }
         if (!r.obj) continue;
+        const inView = r.obj.x >= 0 && r.obj.y >= 0 && r.obj.x + r.obj.s <= 320 * k && r.obj.y + r.obj.s <= 240 * k;
+        if (!inView) continue; // it has left the frame; any box it leaves is checked as a stray above
         if (expired) {
           if (hit) lingering++;
           continue;

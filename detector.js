@@ -6,9 +6,11 @@
  *      back again, keeping only points that return to where they started.
  *   2. Fit a homography to those matches with RANSAC. Background points dominate, so this
  *      is the camera's own motion; points on moving objects get rejected as outliers.
- *   3. Warp the previous frame onto the current one, match its brightness (auto exposure), and
- *      compare each pixel with its 3x3 neighbourhood there, which tolerates 1 px of misalignment.
- *      Whatever still differs moved independently of the camera.
+ *   3. Warp the previous two frames onto the current one, match their brightness (auto exposure),
+ *      and compare each pixel with its 3x3 neighbourhood in each, which tolerates 1 px of
+ *      misalignment. Changes since the previous frame outline each blob; a blob is only kept if
+ *      some of its pixels also differ from the frame before last. The spot an object just left
+ *      matches that frame, so no ghost is left behind, and a glitch in one frame is ignored.
  *   4. Threshold and clean up with morphology. Nearby blobs are grouped using a dilated copy of
  *      the mask, but each box is fitted to the undilated pixels so it hugs the object.
  *   5. Feed the boxes to a tracker. A target is reported once it has been seen in minHits frames.
@@ -27,9 +29,11 @@
     threshold: 30,        // gray-level difference (0-255) that counts as change
     minArea: 0.0001,      // smallest motion box to report, as a fraction of the frame area
     maxChangedArea: 0.4,  // if more than this fraction changed, motion estimate is bad: report nothing
-    minHits: 2,           // frames a target must be seen in before it is reported
+    minHits: 3,           // frames a target must be seen in before it is reported
+    minHoldHits: 5,       // frames a target must be seen in before it is held after stopping
     holdMs: 3000,         // how long a target stays boxed after it stops moving
     matchDistance: 0.06,  // extra distance (fraction of frame size) a target may jump between frames
+    maxCoastFrames: 5,    // frames a fast target that went unseen keeps moving along its path
     maxTracks: 30,
     maxCorners: 300,      // at 320 px; scales with frame size up to 400
     minFeatures: 12,      // fewer tracked points than this: camera motion can't be trusted
@@ -38,16 +42,30 @@
   };
 
   const odd = (n) => Math.max(3, 2 * Math.floor(n / 2) + 1);
+  const IDENTITY = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+
+  // Product of two row-major 3x3 matrices: applying b, then a.
+  function multiply(a, b) {
+    const r = new Array(9);
+    for (let i = 0; i < 3; i++)
+      for (let j = 0; j < 3; j++)
+        r[3 * i + j] = a[3 * i] * b[j] + a[3 * i + 1] * b[3 + j] + a[3 * i + 2] * b[6 + j];
+    return r;
+  }
 
   function createDetector(cv, options) {
     const opts = Object.assign({}, DEFAULTS, options);
 
     let width = 0;
     let height = 0;
-    let hasPrev = false;
-    let tracks = []; // { x, y, w, h, vx, vy, hits, lastSeen, held, id }
+    let started = false;
+    let frameCount = 0; // frames in a row with a known camera motion (0 after a reset or loss)
+    let lastMotion = null; // camera motion prev2 -> prev, as a row-major 3x3 array
+    // { x, y, w, h, vx, vy, hits, lastSeen, held, coast: frames coasted, cx/cy: offset coasted, id }
+    let tracks = [];
     let nextId = 1;
-    let rgba, gray, prevGray, warped, warpedMin, warpedMax, above, motion, groups, valid, warpedValid;
+    let rgba, gray, prevGray, prev2Gray, warped, warpedMin, warpedMax, above, motion, motion2, groups;
+    let valid, warpedValid;
     let kernelOpen, kernelGrow;
     let scale = 1; // frame size relative to the 320 px the defaults are tuned for
     let pyramidLevels;
@@ -59,7 +77,8 @@
     const criteria = new cv.TermCriteria(cv.TermCriteria_EPS | cv.TermCriteria_COUNT, 20, 0.03);
 
     function freeFrames() {
-      const mats = [rgba, gray, prevGray, warped, warpedMin, warpedMax, above, motion, groups, valid, warpedValid];
+      const mats = [rgba, gray, prevGray, prev2Gray, warped, warpedMin, warpedMax, above, motion, motion2, groups,
+        valid, warpedValid];
       for (const m of [...mats, kernelOpen, kernelGrow]) {
         if (m) m.delete();
       }
@@ -78,8 +97,10 @@
       rgba = new cv.Mat(h, w, cv.CV_8UC4);
       gray = new cv.Mat(h, w, cv.CV_8UC1);
       prevGray = new cv.Mat(h, w, cv.CV_8UC1);
+      prev2Gray = new cv.Mat(h, w, cv.CV_8UC1);
       warped = new cv.Mat(h, w, cv.CV_8UC1);
       motion = new cv.Mat(h, w, cv.CV_8UC1);
+      motion2 = new cv.Mat(h, w, cv.CV_8UC1);
       groups = new cv.Mat(h, w, cv.CV_8UC1);
       valid = new cv.Mat(h, w, cv.CV_8UC1, new cv.Scalar(255));
       warpedValid = new cv.Mat(h, w, cv.CV_8UC1);
@@ -90,7 +111,9 @@
     }
 
     function reset() {
-      hasPrev = false;
+      started = false;
+      frameCount = 0;
+      lastMotion = null;
       tracks = [];
     }
 
@@ -189,7 +212,8 @@
     }
 
     // Groups come from the dilated mask; each box is then shrunk to the motion pixels inside it.
-    function findBoxes() {
+    // With `confirm`, groups without pixels that also changed since the frame before last are dropped.
+    function findBoxes(confirm) {
       const contours = new cv.MatVector();
       const hierarchy = new cv.Mat();
       cv.findContours(groups, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
@@ -199,8 +223,8 @@
         const c = contours.get(i);
         const g = cv.boundingRect(c);
         c.delete();
-        const r = motionBounds(g);
-        if (r && r.w * r.h >= minPx) boxes.push(r);
+        const r = motionBounds(g, confirm);
+        if (r && r.w * r.h >= minPx && (!confirm || r.confirmed >= 2)) boxes.push(r);
       }
       contours.delete();
       hierarchy.delete();
@@ -209,20 +233,24 @@
 
     // Bounding box of the motion pixels inside rect g, or null if there are none.
     // (This OpenCV.js build has no findNonZero.)
-    function motionBounds(g) {
-      const px = motion.data;
+    // With `confirm`, only confirmed (two-step) pixels count, so a ghost that the grouping step
+    // joined onto its object doesn't stretch the box; `confirmed` is how many there were.
+    function motionBounds(g, confirm) {
+      const px = confirm ? motion2.data : motion.data;
       let minX = Infinity, minY = Infinity, maxX = -1, maxY = -1;
+      let confirmed = 0;
       for (let y = g.y; y < g.y + g.height; y++) {
         const row = y * width;
         for (let x = g.x; x < g.x + g.width; x++) {
           if (!px[row + x]) continue;
+          confirmed++;
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
           if (y < minY) minY = y;
           maxY = y;
         }
       }
-      return maxX < 0 ? null : { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+      return maxX < 0 ? null : { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1, confirmed };
     }
 
     // ---------- Target tracking ----------
@@ -270,20 +298,43 @@
         matchedDetections.add(di);
         const t = tracks[ti];
         const d = detections[di];
-        t.vx = 0.5 * t.vx + 0.5 * (d.x + d.w / 2 - (t.x + t.w / 2));
-        t.vy = 0.5 * t.vy + 0.5 * (d.y + d.h / 2 - (t.y + t.h / 2));
+        // Per-frame movement since it was last seen (undoing any coasting along the prediction).
+        const steps = t.coast + 1;
+        t.vx = 0.5 * t.vx + 0.5 * ((d.x + d.w / 2 - (t.x + t.w / 2) + t.cx) / steps);
+        t.vy = 0.5 * t.vy + 0.5 * ((d.y + d.h / 2 - (t.y + t.h / 2) + t.cy) / steps);
         Object.assign(t, { x: d.x, y: d.y, w: d.w, h: d.h, hits: t.hits + 1, lastSeen: now, held: false });
+        t.coast = t.cx = t.cy = 0;
       }
 
+      const slowSpeed = Math.max(1, scale); // px per frame
       tracks = tracks.filter((t, ti) => {
         if (matchedTracks.has(ti)) return true;
-        // It stopped: hold it where it was last seen.
+        if (t.held) return true;
+        // Unseen this frame. A target that was moving fast has most likely just been missed (it
+        // blended into the background, or the frame was blurred), not stopped: keep it moving along
+        // its path for a few frames so the same target picks it up again.
+        const speed = Math.hypot(t.vx, t.vy);
+        if (t.coast < opts.maxCoastFrames && speed > Math.max(slowSpeed, 0.25 * Math.max(t.w, t.h))) {
+          t.x += t.vx;
+          t.y += t.vy;
+          t.cx += t.vx;
+          t.cy += t.vy;
+          t.coast++;
+          return t.hits >= opts.minHits;
+        }
+        // It stopped (or wasn't found again): hold it where it was last seen.
+        t.x -= t.cx;
+        t.y -= t.cy;
+        t.coast = t.cx = t.cy = 0;
         t.vx = t.vy = 0;
         t.held = true;
-        return t.hits >= opts.minHits; // an unconfirmed one-frame blip was just noise
+        // Only hold targets followed for a while; short-lived fragments and flickers just vanish.
+        return t.hits >= opts.minHoldHits;
       });
       detections.forEach((d, di) => {
-        if (!matchedDetections.has(di)) tracks.push({ ...d, vx: 0, vy: 0, hits: 1, lastSeen: now, held: false, id: nextId++ });
+        if (!matchedDetections.has(di)) {
+          tracks.push({ ...d, vx: 0, vy: 0, hits: 1, lastSeen: now, held: false, coast: 0, cx: 0, cy: 0, id: nextId++ });
+        }
       });
       mergeOverlappingTracks(now);
     }
@@ -343,7 +394,7 @@
             y,
             w: Math.min(width, Math.round(t.x + t.w)) - x,
             h: Math.min(height, Math.round(t.y + t.h)) - y,
-            held: t.lastSeen !== now,
+            held: t.held,
             id: t.id,
           };
         });
@@ -360,9 +411,9 @@
       cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY);
       cv.GaussianBlur(gray, gray, blurSize, 0); // 5x5 at any size; larger kernels are far slower here
 
-      if (!hasPrev) {
-        gray.copyTo(prevGray);
-        hasPrev = true;
+      if (!started) {
+        started = true;
+        advance(null);
         return { boxes: [], mode: 'init', features: 0, inliers: 0 };
       }
 
@@ -370,49 +421,88 @@
       expireTracks(now);
       if (!H) {
         // Can't tell where the camera went; leave held boxes where they are until it settles.
-        gray.copyTo(prevGray);
+        advance(null);
         return { boxes: reportTracks(now), mode: 'lost', features, inliers };
       }
-      if (H !== identity) moveTracks(H.data64F.slice());
-
-      const size = new cv.Size(width, height);
-      const black = new cv.Scalar(0);
-      cv.warpPerspective(prevGray, warped, H, size, cv.INTER_LINEAR, cv.BORDER_CONSTANT, black);
-      // Pixels warped in from outside the previous frame have no valid comparison.
-      cv.warpPerspective(valid, warpedValid, H, size, cv.INTER_NEAREST, cv.BORDER_CONSTANT, black);
-      cv.erode(warpedValid, warpedValid, kernelGrow);
+      const m1 = H === identity ? IDENTITY : H.data64F.slice();
       if (H !== identity) H.delete();
+      if (m1 !== IDENTITY) moveTracks(m1);
 
-      matchBrightness();
-
-      // A pixel only counts as changed if it falls outside the brightness range of its 3x3
-      // neighbourhood in the aligned previous frame. This forgives up to 1 px of misalignment, which
-      // otherwise flickers on every sharp edge; real movers shift more than that against their
-      // surroundings. Kept at 3x3 at every size so small, slow movers still register.
-      cv.erode(warped, warpedMin, kernelOpen);
-      cv.dilate(warped, warpedMax, kernelOpen);
-      cv.subtract(gray, warpedMax, above); // saturates at 0: only where brighter than any neighbour
-      cv.subtract(warpedMin, gray, motion); // only where darker than any neighbour
-      cv.add(motion, above, motion);
+      // What changed since the previous frame gives each blob's full extent...
+      changedSince(prevGray, m1, warpedValid, motion);
       cv.threshold(motion, motion, opts.threshold, 255, cv.THRESH_BINARY);
       cv.bitwise_and(motion, warpedValid, motion);
       cv.morphologyEx(motion, motion, cv.MORPH_OPEN, kernelOpen);
       cv.dilate(motion, groups, kernelGrow, new cv.Point(-1, -1), 2);
+      // ...and pixels that also changed since the frame before (camera motion composed over both
+      // steps) confirm it. A spot an object has just left, or a glitch in the previous frame, matches
+      // the frame before last, so its blob has no confirmed pixels and is dropped.
+      const twoStep = frameCount >= 1 && lastMotion !== null;
+      if (twoStep) {
+        // Its result is only used where the first comparison found motion, so it reuses that one's
+        // valid-pixel mask instead of warping its own.
+        changedSince(prev2Gray, multiply(m1, lastMotion), null, motion2);
+        cv.threshold(motion2, motion2, opts.threshold, 255, cv.THRESH_BINARY);
+        cv.bitwise_and(motion2, motion, motion2);
+      }
 
-      gray.copyTo(prevGray);
+      advance(m1);
 
       if (cv.countNonZero(groups) > opts.maxChangedArea * width * height) {
         return { boxes: reportTracks(now), mode: 'noisy', features, inliers };
       }
-      updateTracks(findBoxes(), now);
+      updateTracks(findBoxes(twoStep), now);
       return { boxes: reportTracks(now), mode: 'ok', features, inliers };
     }
 
+    // Shifts the frame history: current -> prev -> prev2. `m` is the camera motion prev -> current,
+    // or null if it is unknown (first frame, lost tracking), which restarts the history.
+    function advance(m) {
+      if (m) {
+        prevGray.copyTo(prev2Gray);
+        lastMotion = m;
+        frameCount++;
+      } else {
+        lastMotion = null;
+        frameCount = 0;
+      }
+      gray.copyTo(prevGray);
+    }
+
+    /**
+     * Writes into `out` how much each pixel of the current frame differs from `ref` once `ref` is
+     * warped by camera motion `m` and brightness-matched. If `validOut` is given it receives the pixels
+     * that have a comparison; otherwise the existing `warpedValid` is used for brightness matching.
+     * A pixel only counts as changed if it falls outside the brightness range of its 3x3 neighbourhood
+     * in the warped frame. This forgives up to 1 px of misalignment, which otherwise flickers on every
+     * sharp edge; real movers shift more than that against their surroundings. Kept at 3x3 at every
+     * size so small, slow movers still register.
+     */
+    function changedSince(ref, m, validOut, out) {
+      const size = new cv.Size(width, height);
+      const black = new cv.Scalar(0);
+      const M = cv.matFromArray(3, 3, cv.CV_64F, m);
+      cv.warpPerspective(ref, warped, M, size, cv.INTER_LINEAR, cv.BORDER_CONSTANT, black);
+      if (validOut) {
+        // Pixels warped in from outside the reference frame have no valid comparison.
+        cv.warpPerspective(valid, validOut, M, size, cv.INTER_NEAREST, cv.BORDER_CONSTANT, black);
+        cv.erode(validOut, validOut, kernelGrow);
+      }
+      M.delete();
+
+      matchBrightness(validOut || warpedValid);
+      cv.erode(warped, warpedMin, kernelOpen);
+      cv.dilate(warped, warpedMax, kernelOpen);
+      cv.subtract(gray, warpedMax, above); // saturates at 0: only where brighter than any neighbour
+      cv.subtract(warpedMin, gray, out); // only where darker than any neighbour
+      cv.add(out, above, out);
+    }
+
     // Phones adjust exposure as the scene changes, brightening or darkening the whole frame.
-    // Scale the warped previous frame so its average brightness matches the current one.
-    function matchBrightness() {
-      const before = cv.mean(warped, warpedValid)[0];
-      const now = cv.mean(gray, warpedValid)[0];
+    // Scale the warped reference frame so its average brightness matches the current one.
+    function matchBrightness(mask) {
+      const before = cv.mean(warped, mask)[0];
+      const now = cv.mean(gray, mask)[0];
       if (before < 1) return;
       const gain = now / before;
       if (Math.abs(gain - 1) > 0.01) warped.convertTo(warped, -1, gain, 0);
