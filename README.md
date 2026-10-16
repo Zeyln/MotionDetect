@@ -1,4 +1,5 @@
 # MotionDetect
+## [Try/MotionDetect](https://zeyln.github.io/MotionDetect/)
 
 A phone web app (PWA) that shows the camera and highlights anything moving in the shot, as a heatmap, a red outline around it, or both. It runs whenever the camera view is open, without recording, and it compensates for the phone itself moving.
 
